@@ -1,0 +1,7 @@
+*.private.txt
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.lake/
+build/
+.DS_Store
