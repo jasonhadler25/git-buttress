@@ -51,7 +51,7 @@ $ git commit -m "Release 2.4.0"
 [main 9f3c1a2] Release 2.4.0
  1 file changed, 14 insertions(+)
 
-$ git tag v2.4.0
+$ git tag -a v2.4.0 -m "Release 2.4.0"
 $ git push --follow-tags
 ```
 
@@ -124,18 +124,19 @@ commit `9f3c1a2`—even though nobody ever used special tag names:
 
    Git aborts the clone before writing a single file to Sam's working directory.
 
-2. **On Sam's existing laptop clone, CI cache, or `--filter=blob:none` partial
-   clone:** Sam already holds genuine commit headers from earlier `git pull`s.
-   If a compromised server later serves a poisoned historical blob during a
-   checkout or `git pull`, Sam's local `buttress-tree` and `buttress-parent`
-   lines catch it immediately.
+2. **On Sam's existing laptop clone or CI cache:** Sam already holds genuine
+   commit headers from earlier `git pull`s. If a compromised server later serves
+   a poisoned historical object during `git fetch`/`git pull` or a `git fsck`
+   audit, Sam's local `buttress-tree` and `buttress-parent` lines catch it
+   immediately.
 
-3. **If Maya signs commits with SSH/GPG (`git commit -S`):** Without
-   `git-buttress`, a Git commit signature only signs SHA-1 hashes—so swapping a
-   file for a SHA1DC twin **leaves GitHub's `"Verified"` badge and
+3. **If Maya signs commits with SSH/GPG (`git commit -S`) and Sam verifies her
+   key (`git verify-commit`):** Without `git-buttress`, a Git commit signature
+   only signs SHA-1 hashes—so swapping a file for a SHA1DC twin **leaves
    `git verify-commit` completely green!** With `git-buttress`, Maya's normal
-   SSH signature automatically signs the BLAKE3 fingerprints inside the commit
-   header, protecting even brand-new users against a total SHA-1 break.
+   SSH signature automatically covers the BLAKE3 fingerprints inside the commit
+   header, so verifying her signature + `git buttress check` protects even
+   brand-new users against a total SHA-1 break.
 
 4. **Sorting clean backups from poisoned mirrors:** Maya has five mirrors and
    laptops all reporting `HEAD = 9f3c1a2`. Running `git fsck` immediately shows
@@ -202,12 +203,15 @@ cargo test --release
 
 * **How `git commit` and `git fsck` stay seamless:** `git buttress enable`
   configures global Git hooks (`post-commit` for commit/rebase/cherry-pick
-  sealing and `reference-transaction` for `clone`/`fetch`/`pull` verification)
-  **plus** a tiny transparent `git` wrapper in `~/.local/bin/git`. On
-  `git commit`, the wrapper seals `HEAD` synchronously via atomic `update-ref`
-  compare-and-swap *before* printing `[branch <sha>]`, so there is no race
-  condition and no stale commit ID; on `git fsck`, it runs stock `git fsck`
-  followed automatically by `git buttress fsck`.
+  sealing and `reference-transaction` for `clone`/`fetch`/`pull` verification,
+  forwarding all 28 standard Git hooks to any prior `core.hooksPath` or
+  `.git/hooks/`) **plus** a tiny transparent `git` wrapper in `~/.local/bin/git`.
+  On `git commit`, `post-commit` rewrites the new local commit with BLAKE3
+  headers via `git update-ref` compare-and-swap while the wrapper holds `-q` so
+  terminal output prints only the final `[branch <sealed-sha>]` summary; on
+  `git fsck`, it runs stock `git fsck` followed automatically by
+  `git buttress fsck`. (`refs/replace/*` grafts are ignored during verification;
+  do not rely on `refs/replace` when consuming verified repositories.)
 * **Configurable policy when BLAKE3 lines are absent:** Mixed teams work out of
   the box because `buttress.missing` defaults to `silent` (mismatch is *always*
   a hard error). Set `git config --global buttress.missing warn` or `error` when

@@ -6,26 +6,28 @@
 //!   20-byte SHA-1 `Oid` to 32-byte BLAKE3 `Dig`, plus an append queue `pending`
 //!   and optional backing file path `disk_path`.
 //! - **Trust boundary:** Disk cache files live in `.git/buttress-cache.bin` and are
-//!   **unauthenticated** performance hints used *exclusively* during commit/tag
-//!   writing (`seal_head` and `buttress.autotag`). Every verification code path
-//!   (`verify_target`, `check`, `fsck`, `reference-transaction` `prepared` phase)
-//!   MUST construct `DigestCache::memory_only()`, where `disk_path == None` and no
-//!   disk bytes are ever read or written.
-//! - **Representation invariant `I(c)`:**
-//!   1. If `c.disk_path.is_none()`, then `c.pending.is_empty()` holds at all times.
-//!   2. Every `(kind, oid, dig)` in `c.pending` has `kind in {1, 2, 3}` and is
-//!      already present with value `dig` in the corresponding in-memory map.
-//! - **Atomicity / crash tolerance:** Each record is 53 bytes (`kind: u8 || oid: [u8; 20] || dig: [u8; 32]`)
-//!   following an 8-byte magic header `b"BTRSC001"`. If a previous process crashed
-//!   mid-append leaving `(file_len - 8) % 53 != 0`, `load_from_git_dir` ignores the
-//!   trailing partial tail and `flush()` truncates the file back to the clean
-//!   `8 + 53 * k` boundary before appending new records (preventing permanent
-//!   53-byte frame misalignment!).
+//!   **unauthenticated** performance hints used *only* for unsigned incremental
+//!   bookkeeping. Every verification code path (`verify_target`, `check`, `fsck`,
+//!   `reference-transaction` `prepared` phase) AND every cryptographic attestation
+//!   (commit signing and `+blake3-` companion tag minting) MUST construct
+//!   `DigestCache::memory_only()`, where `disk_path == None` and no disk bytes are
+//!   ever read or written.
+//! - **Representation invariant `I_cache(c)`:**
+//!   1. `c.disk_path.is_none() ==> c.pending.is_empty()`.
+//!   2. Consistent last-write-wins semantics across memory and disk: whenever
+//!      `put_{blob,tree,commit}(oid, dig)` sets `map[oid] == dig` and either `oid`
+//!      was previously absent OR had a *different* value, `(kind, oid, dig)` is
+//!      appended to `c.pending` (when `c.disk_path.is_some()`), so reloading after
+//!      `flush()` yields the exact same maps as in memory!
+//!   3. Maps are private so external callers cannot mutate them out of sync with
+//!      `pending`.
+//! - **Keyed SipHash (DoS-safe):** Uses standard `HashMap` with Rust's randomized
+//!   SipHash rather than an unkeyed prefix hasher, preventing hash-flooding O(N^2)
+//!   degradation under adversarial SHA-1 OIDs.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::hash::{BuildHasherDefault, Hasher as StdHasher};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub type Oid = [u8; 20];
@@ -38,34 +40,12 @@ const KIND_BLOB: u8 = 1;
 const KIND_TREE: u8 = 2;
 const KIND_COMMIT: u8 = 3;
 
-#[derive(Default)]
-pub struct OidHasher(u64);
-
-/// Hashes 20-byte uniformly distributed Git OIDs by reading their leading 8 bytes
-/// (falling back to FNV-style mixing on shorter slices); preserves `StdHasher` determinism.
-impl StdHasher for OidHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    #[inline]
-    fn write(&mut self, b: &[u8]) {
-        if b.len() >= 8 {
-            self.0 = u64::from_le_bytes(b[..8].try_into().unwrap());
-        } else {
-            for &x in b {
-                self.0 = self.0.wrapping_mul(0x100000001b3) ^ (x as u64);
-            }
-        }
-    }
-}
-
-pub type OidMap<V> = HashMap<Oid, V, BuildHasherDefault<OidHasher>>;
+pub type OidMap<V> = HashMap<Oid, V>;
 
 pub struct DigestCache {
-    pub blobs: OidMap<Dig>,
-    pub trees: OidMap<Dig>,
-    pub commits: OidMap<Dig>,
+    blobs: OidMap<Dig>,
+    trees: OidMap<Dig>,
+    commits: OidMap<Dig>,
     pending: Vec<(u8, Oid, Dig)>,
     disk_path: Option<PathBuf>,
 }
@@ -73,28 +53,36 @@ pub struct DigestCache {
 impl DigestCache {
     /// Contract:
     /// - `requires`: true
-    /// - `ensures`: returns `c` with empty maps, `c.pending.is_empty()`, and `c.disk_path == None`.
-    /// - `writes`: nothing (pure allocation).
+    /// - `ensures`: returns `c` satisfying `I_cache(c)` with empty maps, `c.pending.is_empty()`,
+    ///   and `c.disk_path == None`.
+    /// - `writes`: nothing.
     pub fn memory_only() -> Self {
         Self {
-            blobs: OidMap::default(),
-            trees: OidMap::default(),
-            commits: OidMap::default(),
+            blobs: OidMap::new(),
+            trees: OidMap::new(),
+            commits: OidMap::new(),
             pending: Vec::new(),
             disk_path: None,
         }
     }
 
     /// Contract:
-    /// - `requires`: `git_dir` is a repository common git directory (may or may not contain `buttress-cache.bin`).
-    /// - `ensures`: returns `c` satisfying `I(c)` with `c.disk_path == Some(git_dir.join("buttress-cache.bin"))`
-    ///   and `c.pending.is_empty()`. Any missing, corrupt-magic, or trailing partial record is ignored without error.
+    /// - `requires`: `git_dir` is a repository common git directory.
+    /// - `ensures`: returns `c` satisfying `I_cache(c)` with `c.disk_path == Some(git_dir.join("buttress-cache.bin"))`
+    ///   and `c.pending.is_empty()`. Refuses symlinks/non-regular files; ignores missing, bad-magic,
+    ///   oversized (> 256 MiB), or trailing partial records without error.
     /// - `writes`: nothing on disk.
     pub fn load_from_git_dir(git_dir: &Path) -> Self {
         let path = git_dir.join("buttress-cache.bin");
         let mut cache = Self::memory_only();
         cache.disk_path = Some(path.clone());
 
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            return cache;
+        };
+        if !meta.file_type().is_file() || meta.len() > (256 << 20) {
+            return cache;
+        }
         let Ok(mut f) = File::open(&path) else {
             return cache;
         };
@@ -125,14 +113,29 @@ impl DigestCache {
         cache
     }
 
+    #[inline]
+    pub fn get_blob(&self, oid: &Oid) -> Option<Dig> {
+        self.blobs.get(oid).copied()
+    }
+
+    #[inline]
+    pub fn get_tree(&self, oid: &Oid) -> Option<Dig> {
+        self.trees.get(oid).copied()
+    }
+
+    #[inline]
+    pub fn get_commit(&self, oid: &Oid) -> Option<Dig> {
+        self.commits.get(oid).copied()
+    }
+
     /// Contract:
-    /// - `requires`: `I(self)`
-    /// - `ensures`: `I(self)` and `self.blobs.get(&oid) == Some(&dig)` (or previous value if already cached;
-    ///   first-write-wins for a given `oid` within a session, overwritten on reload if re-inserted).
-    /// - `writes`: `self.blobs`, `self.pending` (only when `self.disk_path.is_some()`).
+    /// - `requires`: `I_cache(self)`
+    /// - `ensures`: `I_cache(self)` and `self.get_blob(&oid) == Some(dig)` (last-write-wins both in memory
+    ///   and on `pending` when `disk_path.is_some()`, so `flush` + `load_from_git_dir` round-trips identically).
+    /// - `writes`: `self.blobs`, `self.pending`.
     #[inline]
     pub fn put_blob(&mut self, oid: Oid, dig: Dig) {
-        if self.blobs.insert(oid, dig).is_none() && self.disk_path.is_some() {
+        if self.blobs.insert(oid, dig) != Some(dig) && self.disk_path.is_some() {
             self.pending.push((KIND_BLOB, oid, dig));
         }
     }
@@ -140,7 +143,7 @@ impl DigestCache {
     /// Contract: same as `put_blob` on `self.trees`.
     #[inline]
     pub fn put_tree(&mut self, oid: Oid, dig: Dig) {
-        if self.trees.insert(oid, dig).is_none() && self.disk_path.is_some() {
+        if self.trees.insert(oid, dig) != Some(dig) && self.disk_path.is_some() {
             self.pending.push((KIND_TREE, oid, dig));
         }
     }
@@ -148,16 +151,16 @@ impl DigestCache {
     /// Contract: same as `put_blob` on `self.commits`.
     #[inline]
     pub fn put_commit(&mut self, oid: Oid, dig: Dig) {
-        if self.commits.insert(oid, dig).is_none() && self.disk_path.is_some() {
+        if self.commits.insert(oid, dig) != Some(dig) && self.disk_path.is_some() {
             self.pending.push((KIND_COMMIT, oid, dig));
         }
     }
 
     /// Contract:
-    /// - `requires`: `I(self)`
-    /// - `ensures`: `I(self)` and `self.pending.is_empty()`. If `self.disk_path == Some(p)` and
-    ///   `old(self.pending)` was non-empty, best-effort persists `old(self.pending)` onto `p`
-    ///   at a clean `8 + 53 * k` record boundary (repairing any bad header or torn trailing bytes first).
+    /// - `requires`: `I_cache(self)`
+    /// - `ensures`: `I_cache(self)` and `self.pending.is_empty()`. Uses a single owned file handle
+    ///   (refusing symlinks) to verify/repair `BTRSC001` and `8 + 53 * k` alignment and write
+    ///   `old(self.pending)` at the clean end-of-records offset.
     /// - `writes`: `self.pending`, filesystem at `self.disk_path` (when `Some`).
     pub fn flush(&mut self) {
         let Some(ref path) = self.disk_path else {
@@ -166,50 +169,80 @@ impl DigestCache {
         if self.pending.is_empty() {
             return;
         }
-        // Check existing file header & alignment so a torn write never misaligns subsequent records!
-        let existing_valid_len: Option<u64> = (|| {
-            let mut f = OpenOptions::new().read(true).write(true).open(path).ok()?;
-            let len = f.metadata().ok()?.len();
-            if len < MAGIC.len() as u64 {
-                return None;
+        // Refuse to follow symlinks on cache path
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if !meta.file_type().is_file() {
+                self.pending.clear();
+                return;
             }
-            let mut hdr = [0u8; 8];
-            f.read_exact(&mut hdr).ok()?;
-            if &hdr != MAGIC {
-                return None;
-            }
-            let body_len = len - MAGIC.len() as u64;
-            let clean_len = MAGIC.len() as u64 + (body_len / REC_LEN as u64) * REC_LEN as u64;
-            if clean_len != len {
-                f.set_len(clean_len).ok()?;
-            }
-            Some(clean_len)
-        })();
+        }
 
-        let need_rewrite = existing_valid_len.is_none();
-        let mut out = Vec::with_capacity(
-            (if need_rewrite { MAGIC.len() } else { 0 }) + self.pending.len() * REC_LEN,
-        );
-        if need_rewrite {
-            out.extend_from_slice(MAGIC);
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc_o_nofollow());
         }
-        for &(k, ref o, ref d) in &self.pending {
-            out.push(k);
-            out.extend_from_slice(o);
-            out.extend_from_slice(d);
-        }
-        let res = if need_rewrite {
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(path)
-        } else {
-            OpenOptions::new().append(true).open(path)
-        };
-        if let Ok(mut f) = res {
-            let _ = f.write_all(&out);
+
+        if let Ok(mut f) = opts.open(path) {
+            let valid_offset: Option<u64> = (|| {
+                let len = f.metadata().ok()?.len();
+                if len < MAGIC.len() as u64 {
+                    return None;
+                }
+                let mut hdr = [0u8; 8];
+                f.seek(SeekFrom::Start(0)).ok()?;
+                f.read_exact(&mut hdr).ok()?;
+                if &hdr != MAGIC {
+                    return None;
+                }
+                let clean_len =
+                    MAGIC.len() as u64 + ((len - MAGIC.len() as u64) / REC_LEN as u64) * REC_LEN as u64;
+                if clean_len != len {
+                    f.set_len(clean_len).ok()?;
+                }
+                Some(clean_len)
+            })();
+
+            let mut out = Vec::with_capacity(MAGIC.len() + self.pending.len() * REC_LEN);
+            match valid_offset {
+                Some(off) => {
+                    for &(k, ref o, ref d) in &self.pending {
+                        out.push(k);
+                        out.extend_from_slice(o);
+                        out.extend_from_slice(d);
+                    }
+                    if f.seek(SeekFrom::Start(off)).is_ok() {
+                        let _ = f.write_all(&out);
+                    }
+                }
+                None => {
+                    out.extend_from_slice(MAGIC);
+                    for &(k, ref o, ref d) in &self.pending {
+                        out.push(k);
+                        out.extend_from_slice(o);
+                        out.extend_from_slice(d);
+                    }
+                    if f.set_len(0).is_ok() && f.seek(SeekFrom::Start(0)).is_ok() {
+                        let _ = f.write_all(&out);
+                    }
+                }
+            }
         }
         self.pending.clear();
     }
+}
+
+#[cfg(target_os = "macos")]
+const fn libc_o_nofollow() -> i32 {
+    0x0100
+}
+#[cfg(target_os = "linux")]
+const fn libc_o_nofollow() -> i32 {
+    0o0400000
+}
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+const fn libc_o_nofollow() -> i32 {
+    0
 }

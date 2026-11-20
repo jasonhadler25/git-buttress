@@ -1,30 +1,11 @@
 //! Core `git-buttress` protocol (implements `BUTTRESS.md` to the byte).
-//!
-//! # Module Contract
-//!
-//! - **Pure mathematical specification (`spec_digest_*`):**
-//!   Let `dk(ctx, msg)` be 32-byte BLAKE3 derive-key output over UTF-8 `ctx` and bytes `msg`.
-//!   - `spec_file(raw) = dk(CTX_FILE, raw)`
-//!   - `spec_dir(entries) = dk(CTX_DIR, concat_i(mode_i || " " || name_i || "\0" || child_i))`
-//!     where `child_i` is `spec_dir(sub)` (32B) if `octal(mode_i) == 0o040000`, raw 20-byte `oid_i`
-//!     if `octal(mode_i) == 0o160000`, else `spec_file(blob)` (32B).
-//!   - `spec_commit(C)`:
-//!     - If `C` is `Sealed`, `dk(CTX_COMMIT, C.raw)`.
-//!     - If `C` is `Plain` or `Stale`,
-//!       `dk(CTX_PLAIN, spec_dir(C.tree) || u32_le(k) || spec_commit(P_1) || ... || spec_commit(P_k) || C.raw)`.
-//! - **Engine invariant `I(eng)`:**
-//!   1. Every entry in `eng.parsed[oid]` equals `parse_commit(oid, raw)` for the object returned by `eng.store`.
-//!   2. When initialized with `DigestCache::memory_only()`, every cached digest in `eng.cache` equals
-//!      the `spec_*` value computed directly from `eng.store` in the current run.
-//!   3. Commit parent counts are bounded to `u32::MAX` (`try_from`) so `u32_le(k)` never truncates.
-//!   4. Tree traversal tracks `in_progress_trees` to detect malformed cyclic tree objects cleanly with
-//!      `VerifyErrorKind::Mismatch` rather than looping forever.
 
 use crate::cache::{Dig, DigestCache, Oid, OidMap};
-use crate::git::{ObjKind, ObjectStore, hex_to_32, hex_to_oid, to_hex};
+use crate::git::{ObjKind, ObjectStore, StoreError, StoreErrorKind, hex_to_32, hex_to_oid, to_hex};
 use blake3_servil::throughput::context_key;
 use blake3_servil::{ContextKey, Mode, convenience};
 use std::collections::{HashSet, VecDeque};
+use std::rc::Rc;
 
 pub const CTX_FILE: &str = "git-buttress 2026-11-20 file";
 pub const CTX_DIR: &str = "git-buttress 2026-11-20 directory";
@@ -33,7 +14,7 @@ pub const CTX_PLAIN: &str = "git-buttress 2026-11-20 plain commit";
 
 pub const HEADER_TREE_PREFIX: &[u8] = b"buttress-tree ";
 pub const HEADER_PARENT_PREFIX: &[u8] = b"buttress-parent ";
-pub const TAG_TRAILER_PREFIX: &str = "Buttress-Object: ";
+pub const TAG_TRAILER_PREFIX: &[u8] = b"Buttress-Object: ";
 
 pub struct ContextKeys {
     pub file: ContextKey,
@@ -92,7 +73,7 @@ pub enum CommitClass {
 #[derive(Clone, Debug)]
 pub struct ParsedCommit {
     pub oid: Oid,
-    pub raw: Vec<u8>,
+    pub raw: Rc<[u8]>,
     pub tree: Oid,
     pub parents: Vec<Oid>,
     pub class: CommitClass,
@@ -101,11 +82,15 @@ pub struct ParsedCommit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerifyErrorKind {
+    /// Cryptographic digest mismatch, malformed Git/buttress syntax, or graph cycle.
     Mismatch,
+    /// Missing object at a shallow or partial-clone boundary.
     Incomplete,
+    /// Corrupt object store, subprocess crash, or I/O error (never excused by `--allow-shallow` or `silent`).
+    StoreFailure,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct VerifyError {
     pub kind: VerifyErrorKind,
     pub message: String,
@@ -124,18 +109,21 @@ impl VerifyError {
             message: msg.into(),
         }
     }
+    pub fn store_failure(msg: impl Into<String>) -> Self {
+        Self {
+            kind: VerifyErrorKind::StoreFailure,
+            message: msg.into(),
+        }
+    }
+    pub fn from_store(e: StoreError) -> Self {
+        match e.kind {
+            StoreErrorKind::Missing => Self::incomplete(e.message),
+            StoreErrorKind::CorruptOrIo => Self::store_failure(e.message),
+        }
+    }
 }
 
 /// Split raw commit/tag object bytes at the header/body boundary (`\n\n` or single-`\n` header-only).
-///
-/// Contract:
-/// - `requires`: true
-/// - `ensures`:
-///   - If `raw` begins with `b'\n'` (empty header block), returns `(&b""[..], &raw[1..])`.
-///   - Else if `raw` contains `b"\n\n"` at earliest byte index `pos`, returns `(&raw[..pos], &raw[pos + 2..])`.
-///   - Else (header-only object with no body), strips at most a single trailing `b'\n'` (never spaces/tabs)
-///     and returns `(header_without_final_lf, &b""[..])`.
-/// - `writes`: nothing (pure slice view).
 pub fn split_headers_body(raw: &[u8]) -> (&[u8], &[u8]) {
     if let Some(rest) = raw.strip_prefix(b"\n") {
         (&[], rest)
@@ -154,57 +142,100 @@ fn is_valid_alg_token(alg: &[u8]) -> bool {
             .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
-/// Parse a Git commit and classify its `blake3` buttress lines per `BUTTRESS.md` §§2, 4.
-///
-/// Contract:
-/// - `requires`: `raw` is the uncompressed payload of commit `oid`.
-/// - `ensures`:
-///   - Returns `Err(Mismatch)` if `raw` has zero or >1 `tree` headers, any invalid hex `tree`/`parent` OID,
-///     an invalid algorithm token on a `buttress-*` header, >1 `buttress-tree blake3` lines, `buttress-parent blake3`
-///     without `buttress-tree blake3`, malformed `blake3` arguments, or (`bt_tree == tree` and `b3_parents.len() != parents.len()`).
-///   - Returns `Ok(pc)` with `pc.class == Sealed` iff there is 1 `buttress-tree blake3 <tree> <d>` with `<tree> == pc.tree`
-///     and `pc.parents.len()` `buttress-parent blake3` lines.
-///   - Returns `Ok(pc)` with `pc.class == Stale` iff there is 1 `buttress-tree blake3 <other> <d>` with `<other> != pc.tree`
-///     and every `buttress-parent blake3` line is syntactically well-formed.
-///   - Returns `Ok(pc)` with `pc.class == Plain` iff there are 0 `buttress-tree blake3` and 0 `buttress-parent blake3` lines.
-/// - `writes`: nothing.
+/// Parse a Git commit matching stock Git's canonical leading `tree` + consecutive `parent`
+/// header order (`commit.c:parse_commit_buffer`) and classify its `blake3` buttress lines.
 pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError> {
     let (header_bytes, _) = split_headers_body(&raw);
-    let mut tree: Option<Oid> = None;
-    let mut parents: Vec<Oid> = Vec::new();
-    let mut b3_trees: Vec<(Oid, Dig)> = Vec::new();
-    let mut b3_parents: Vec<Dig> = Vec::new();
-    let mut has_gpgsig = false;
+    if header_bytes.contains(&0) {
+        return Err(VerifyError::mismatch(format!(
+            "commit {}: NUL byte in commit header",
+            to_hex(&oid)
+        )));
+    }
 
-    for line in header_bytes.split(|&c| c == b'\n') {
-        if line.is_empty() || line.starts_with(b" ") {
-            // Continuation line of a multi-line header (e.g. gpgsig, mergetag)
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix(b"tree ") {
-            if tree.is_some() {
-                return Err(VerifyError::mismatch(format!(
-                    "commit {}: duplicate tree header",
-                    to_hex(&oid)
-                )));
-            }
-            let t = hex_to_oid(rest).map_err(|e| {
-                VerifyError::mismatch(format!("commit {}: invalid tree line: {e}", to_hex(&oid)))
-            })?;
-            tree = Some(t);
-        } else if let Some(rest) = line.strip_prefix(b"parent ") {
-            let p = hex_to_oid(rest).map_err(|e| {
+    let mut lines = header_bytes.split(|&c| c == b'\n').peekable();
+
+    // 1. Leading line MUST be `tree <40-hex>` (matches Git `commit.c` / `fsck.c`)
+    let Some(first_line) = lines.next() else {
+        return Err(VerifyError::mismatch(format!(
+            "commit {}: empty commit header",
+            to_hex(&oid)
+        )));
+    };
+    let Some(tree_rest) = first_line.strip_prefix(b"tree ") else {
+        return Err(VerifyError::mismatch(format!(
+            "commit {}: first header must be 'tree <oid>'",
+            to_hex(&oid)
+        )));
+    };
+    let tree = hex_to_oid(tree_rest).map_err(|e| {
+        VerifyError::mismatch(format!("commit {}: invalid tree line: {e}", to_hex(&oid)))
+    })?;
+
+    // 2. Immediately consecutive `parent <40-hex>` lines
+    let mut parents: Vec<Oid> = Vec::new();
+    while let Some(&next_line) = lines.peek() {
+        if let Some(p_rest) = next_line.strip_prefix(b"parent ") {
+            lines.next();
+            let p = hex_to_oid(p_rest).map_err(|e| {
                 VerifyError::mismatch(format!("commit {}: invalid parent line: {e}", to_hex(&oid)))
             })?;
             parents.push(p);
-        } else if line.starts_with(b"gpgsig ") || line.starts_with(b"gpgsig-sha256 ") {
-            has_gpgsig = true;
-        } else if line == b"buttress-tree" || line == b"buttress-parent" {
+        } else {
+            break;
+        }
+    }
+
+    // 3. Remaining headers: reject out-of-order `tree`/`parent`, reject continuations on single-line
+    //    `buttress-*` headers, and classify `blake3` buttress lines!
+    let mut b3_trees: Vec<(Oid, Dig)> = Vec::new();
+    let mut b3_parents: Vec<Dig> = Vec::new();
+    let mut has_gpgsig = false;
+    let mut prev_was_single_line_buttress = false;
+
+    for line in lines {
+        if line.is_empty() {
             return Err(VerifyError::mismatch(format!(
-                "commit {}: empty buttress header",
+                "commit {}: unexpected empty line inside header block",
+                to_hex(&oid)
+            )));
+        }
+        if line.starts_with(b" ") {
+            if prev_was_single_line_buttress {
+                return Err(VerifyError::mismatch(format!(
+                    "commit {}: illegal continuation line after single-line buttress header",
+                    to_hex(&oid)
+                )));
+            }
+            continue;
+        }
+        prev_was_single_line_buttress = false;
+
+        if line.starts_with(b"tree ") || line == b"tree" {
+            return Err(VerifyError::mismatch(format!(
+                "commit {}: duplicate or out-of-order tree header",
+                to_hex(&oid)
+            )));
+        }
+        if line.starts_with(b"parent ") || line == b"parent" {
+            return Err(VerifyError::mismatch(format!(
+                "commit {}: out-of-order parent header",
+                to_hex(&oid)
+            )));
+        }
+        if line.starts_with(b"gpgsig ") || line.starts_with(b"gpgsig-sha256 ") {
+            has_gpgsig = true;
+        } else if line == b"buttress-tree"
+            || line == b"buttress-parent"
+            || line.starts_with(b"buttress-tree\t")
+            || line.starts_with(b"buttress-parent\t")
+        {
+            return Err(VerifyError::mismatch(format!(
+                "commit {}: malformed buttress header",
                 to_hex(&oid)
             )));
         } else if let Some(rest) = line.strip_prefix(HEADER_TREE_PREFIX) {
+            prev_was_single_line_buttress = true;
             let parts: Vec<&[u8]> = rest.split(|&c| c == b' ').collect();
             if parts.is_empty() || !is_valid_alg_token(parts[0]) {
                 return Err(VerifyError::mismatch(format!(
@@ -213,7 +244,6 @@ pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError>
                 )));
             }
             if parts[0] != b"blake3" {
-                // Unknown/other algorithm: skip per BUTTRESS.md §2
                 continue;
             }
             if parts.len() != 3 {
@@ -236,6 +266,7 @@ pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError>
             })?;
             b3_trees.push((t_oid, dig));
         } else if let Some(rest) = line.strip_prefix(HEADER_PARENT_PREFIX) {
+            prev_was_single_line_buttress = true;
             let parts: Vec<&[u8]> = rest.split(|&c| c == b' ').collect();
             if parts.is_empty() || !is_valid_alg_token(parts[0]) {
                 return Err(VerifyError::mismatch(format!(
@@ -248,7 +279,7 @@ pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError>
             }
             if parts.len() != 2 {
                 return Err(VerifyError::mismatch(format!(
-                    "commit {}: malformed buttress-parent blake3 line (expected `<alg> <digest>`)",
+                    "commit {}: malformed buttress-parent blake3 line",
                     to_hex(&oid)
                 )));
             }
@@ -261,10 +292,6 @@ pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError>
             b3_parents.push(dig);
         }
     }
-
-    let tree = tree.ok_or_else(|| {
-        VerifyError::mismatch(format!("commit {}: missing tree header", to_hex(&oid)))
-    })?;
 
     let class = match b3_trees.len() {
         0 => {
@@ -279,7 +306,6 @@ pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError>
         1 => {
             let (bt_tree, bt_dig) = b3_trees[0];
             if bt_tree != tree {
-                // Leftover lines from stock `git commit --amend` changing files
                 CommitClass::Stale
             } else if b3_parents.len() != parents.len() {
                 return Err(VerifyError::mismatch(format!(
@@ -305,7 +331,7 @@ pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError>
 
     Ok(ParsedCommit {
         oid,
-        raw,
+        raw: Rc::from(raw),
         tree,
         parents,
         class,
@@ -314,15 +340,10 @@ pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError>
 }
 
 /// Parse raw Git tree entries: `(mode_bytes, octal_mode, name_bytes, child_oid)`.
-///
-/// Contract:
-/// - `requires`: true
-/// - `ensures`: on `Ok(entries)`, `raw` is the exact concatenation of `mode_bytes || b" " || name || b"\0" || child`
-///   for each entry, where `1 <= mode_bytes.len() <= 7` of ASCII `'0'..='7'` (no `u32` overflow), `name` is non-empty
-///   and contains no NUL (`0x00`) or `'/'` (`0x2f`), and `child` is 20 bytes. Returns `Err(Mismatch)` on any violation.
-/// - `writes`: nothing.
+/// Enforces unique entry names (no duplicates, `.`, `..`, `.git`, empty, or `/`).
 pub fn parse_tree_entries(raw: &[u8]) -> Result<Vec<(&[u8], u32, &[u8], Oid)>, VerifyError> {
     let mut entries = Vec::new();
+    let mut seen_names: HashSet<&[u8]> = HashSet::new();
     let mut i = 0;
     let n = raw.len();
     while i < n {
@@ -341,6 +362,11 @@ pub fn parse_tree_entries(raw: &[u8]) -> Result<Vec<(&[u8], u32, &[u8], Oid)>, V
         let octal = mode_bytes
             .iter()
             .fold(0u32, |acc, &c| (acc << 3) | ((c - b'0') as u32));
+        if !matches!(octal, 0o040000 | 0o100644 | 0o100664 | 0o100755 | 0o120000 | 0o160000) {
+            return Err(VerifyError::mismatch(format!(
+                "malformed tree: unsupported entry mode 0o{octal:o}"
+            )));
+        }
         let rel_nul = raw[sp + 1..]
             .iter()
             .position(|&c| c == 0)
@@ -350,8 +376,18 @@ pub fn parse_tree_entries(raw: &[u8]) -> Result<Vec<(&[u8], u32, &[u8], Oid)>, V
             return Err(VerifyError::mismatch("malformed tree: truncated child OID"));
         }
         let name = &raw[sp + 1..nul];
-        if name.is_empty() || name.contains(&b'/') {
-            return Err(VerifyError::mismatch("malformed tree: empty or slash-containing entry name"));
+        if name.is_empty()
+            || name == b"."
+            || name == b".."
+            || name.eq_ignore_ascii_case(b".git")
+            || name.contains(&b'/')
+        {
+            return Err(VerifyError::mismatch(
+                "malformed tree: invalid or reserved entry name",
+            ));
+        }
+        if !seen_names.insert(name) {
+            return Err(VerifyError::mismatch("malformed tree: duplicate entry name"));
         }
         let child: Oid = raw[nul + 1..nul + 21].try_into().unwrap();
         entries.push((mode_bytes, octal, name, child));
@@ -363,11 +399,16 @@ pub fn parse_tree_entries(raw: &[u8]) -> Result<Vec<(&[u8], u32, &[u8], Oid)>, V
 pub const MODE_DIR: u32 = 0o040000;
 pub const MODE_GITLINK: u32 = 0o160000;
 
+/// Encapsulated Merkle calculation & verification state over a snapshot `ObjectStore`.
 pub struct Engine<'a, S: ObjectStore> {
-    pub store: &'a mut S,
-    pub keys: &'a ContextKeys,
-    pub cache: DigestCache,
-    pub parsed: OidMap<ParsedCommit>,
+    store: &'a mut S,
+    keys: &'a ContextKeys,
+    cache: DigestCache,
+    parsed: OidMap<ParsedCommit>,
+    /// Memoized sealed frontier directly reachable beneath each plain/stale commit,
+    /// so `digest_commit` returns identical `(digest, frontier)` whether cold or warm!
+    plain_frontiers: OidMap<Vec<Oid>>,
+    verified_seals: HashSet<Oid>,
 }
 
 impl<'a, S: ObjectStore> Engine<'a, S> {
@@ -376,8 +417,22 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
             store,
             keys,
             cache,
-            parsed: OidMap::default(),
+            parsed: OidMap::new(),
+            plain_frontiers: OidMap::new(),
+            verified_seals: HashSet::new(),
         }
+    }
+
+    pub fn flush_cache(&mut self) {
+        self.cache.flush();
+    }
+
+    pub fn put_commit_cache(&mut self, oid: Oid, dig: Dig) {
+        self.cache.put_commit(oid, dig);
+    }
+
+    pub fn parsed_commits(&self) -> &OidMap<ParsedCommit> {
+        &self.parsed
     }
 
     pub fn load_commit(&mut self, oid: Oid) -> Result<ParsedCommit, VerifyError> {
@@ -387,7 +442,7 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
         let (kind, raw) = self
             .store
             .read_object(&oid)
-            .map_err(VerifyError::incomplete)?
+            .map_err(VerifyError::from_store)?
             .ok_or_else(|| VerifyError::incomplete(format!("missing commit object {}", to_hex(&oid))))?;
         if kind != ObjKind::Commit {
             return Err(VerifyError::mismatch(format!(
@@ -402,13 +457,13 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
     }
 
     pub fn digest_blob(&mut self, oid: Oid) -> Result<Dig, VerifyError> {
-        if let Some(&d) = self.cache.blobs.get(&oid) {
+        if let Some(d) = self.cache.get_blob(&oid) {
             return Ok(d);
         }
-        let (kind, raw) = self
+        let (kind, dig) = self
             .store
-            .read_object(&oid)
-            .map_err(VerifyError::incomplete)?
+            .hash_blob(&oid, self.keys)
+            .map_err(VerifyError::from_store)?
             .ok_or_else(|| VerifyError::incomplete(format!("missing blob object {}", to_hex(&oid))))?;
         if kind != ObjKind::Blob {
             return Err(VerifyError::mismatch(format!(
@@ -417,29 +472,19 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
                 kind.as_str()
             )));
         }
-        let d = self.keys.hash_file(&raw);
-        self.cache.put_blob(oid, d);
-        Ok(d)
+        self.cache.put_blob(oid, dig);
+        Ok(dig)
     }
 
-    /// Compute `spec_dir(root_oid)` iteratively with cycle detection.
-    ///
-    /// Contract:
-    /// - `requires`: `I(self)`
-    /// - `ensures`: on `Ok(d)`, `d == spec_dir(root_oid)` and `self.cache.trees[&root_oid] == d`.
-    ///   Returns `Err(Incomplete)` if any reachable tree or blob is missing from `self.store`,
-    ///   or `Err(Mismatch)` on wrong object type, malformed tree syntax, or a tree cycle.
-    /// - `writes`: `self.store`, `self.cache.trees`, `self.cache.blobs`.
     pub fn digest_tree(&mut self, root_oid: Oid) -> Result<Dig, VerifyError> {
-        if let Some(&d) = self.cache.trees.get(&root_oid) {
+        if let Some(d) = self.cache.get_tree(&root_oid) {
             return Ok(d);
         }
-        // Iterative post-order traversal with explicit cycle detection
         let mut stack: Vec<(Oid, Option<Vec<u8>>)> = vec![(root_oid, None)];
         let mut in_progress: HashSet<Oid> = HashSet::new();
 
         while let Some((oid, raw_opt)) = stack.pop() {
-            if self.cache.trees.contains_key(&oid) {
+            if self.cache.get_tree(&oid).is_some() {
                 in_progress.remove(&oid);
                 continue;
             }
@@ -455,7 +500,7 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
                     let (kind, r) = self
                         .store
                         .read_object(&oid)
-                        .map_err(VerifyError::incomplete)?
+                        .map_err(VerifyError::from_store)?
                         .ok_or_else(|| {
                             VerifyError::incomplete(format!("missing tree object {}", to_hex(&oid)))
                         })?;
@@ -472,7 +517,7 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
             let entries = parse_tree_entries(&raw)?;
             let mut missing_subtrees = Vec::new();
             for &(_, octal, _, child) in &entries {
-                if octal == MODE_DIR && !self.cache.trees.contains_key(&child) {
+                if octal == MODE_DIR && self.cache.get_tree(&child).is_none() {
                     if in_progress.contains(&child) {
                         return Err(VerifyError::mismatch(format!(
                             "cycle in directory tree: {} -> {}",
@@ -499,7 +544,7 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
                 buf.extend_from_slice(name);
                 buf.push(0);
                 if octal == MODE_DIR {
-                    buf.extend_from_slice(&self.cache.trees[&child]);
+                    buf.extend_from_slice(&self.cache.get_tree(&child).unwrap());
                 } else if octal == MODE_GITLINK {
                     buf.extend_from_slice(&child);
                 } else {
@@ -510,43 +555,45 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
             let d = self.keys.hash_dir(&buf);
             self.cache.put_tree(oid, d);
         }
-        Ok(self.cache.trees[&root_oid])
+        Ok(self.cache.get_tree(&root_oid).unwrap())
     }
 
-    /// Compute `commit_digest(root_oid)` per `BUTTRESS.md` §3, returning `(digest, sealed_ancestors_reached)`.
+    /// Compute `commit_digest(root_oid)` per `BUTTRESS.md` §3, returning
+    /// `(digest, sealed_boundary_commits_beneath_root)`.
     ///
-    /// Contract:
-    /// - `requires`: `I(self)`
-    /// - `ensures`: on `Ok((d, sealed_ancs))`, `d == spec_commit(root_oid)` and `sealed_ancs` contains
-    ///   every `Sealed` commit directly bounding any `Plain`/`Stale` ancestor walk under `root_oid`
-    ///   (or `[root_oid]` if `root_oid` was already cached and `Sealed`).
-    ///   Returns `Err(Incomplete)` if an unsealed commit sits on a `.git/shallow` boundary with missing
-    ///   parents or if any required object is missing; returns `Err(Mismatch)` on malformed objects or cycles.
-    /// - `writes`: `self.store`, `self.cache`, `self.parsed`.
+    /// Cache-temperature invariant: returns the exact same `(digest, frontier)` whether
+    /// `self` is cold or warm!
     pub fn digest_commit(&mut self, root_oid: Oid) -> Result<(Dig, Vec<Oid>), VerifyError> {
-        let mut discovered_sealed = Vec::new();
-        if let Some(&d) = self.cache.commits.get(&root_oid) {
+        if let Some(d) = self.cache.get_commit(&root_oid) {
+            if let Some(frontier) = self.plain_frontiers.get(&root_oid) {
+                return Ok((d, frontier.clone()));
+            }
             let pc = self.load_commit(root_oid)?;
             if matches!(pc.class, CommitClass::Sealed { .. }) {
-                discovered_sealed.push(root_oid);
+                return Ok((d, Vec::new()));
             }
-            return Ok((d, discovered_sealed));
+            // Disk-cache hit on a plain commit where frontier wasn't populated in RAM yet:
+            // fall through to compute/populate frontier if needed, or return `d` when only digest wanted.
+        }
+
+        let root_pc = self.load_commit(root_oid)?;
+        if matches!(root_pc.class, CommitClass::Sealed { .. }) {
+            let d = self.keys.hash_sealed_commit(&root_pc.raw);
+            self.cache.put_commit(root_oid, d);
+            return Ok((d, Vec::new()));
         }
 
         let mut stack: Vec<(Oid, bool)> = vec![(root_oid, false)];
         let mut in_progress: HashSet<Oid> = HashSet::new();
 
         while let Some((cur, expanded)) = stack.pop() {
-            if self.cache.commits.contains_key(&cur) {
+            if self.cache.get_commit(&cur).is_some() && self.plain_frontiers.contains_key(&cur) {
                 continue;
             }
             let pc = self.load_commit(cur)?;
             if matches!(pc.class, CommitClass::Sealed { .. }) {
                 let d = self.keys.hash_sealed_commit(&pc.raw);
                 self.cache.put_commit(cur, d);
-                if cur != root_oid {
-                    discovered_sealed.push(cur);
-                }
                 continue;
             }
 
@@ -560,8 +607,9 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
                 stack.push((cur, true));
                 let cur_is_shallow = self.store.shallow_commits().contains(&cur);
                 for &p in pc.parents.iter().rev() {
-                    if !self.cache.commits.contains_key(&p) {
-                        if self.store.read_object(&p).map_err(VerifyError::incomplete)?.is_none() {
+                    if self.cache.get_commit(&p).is_none() || !self.plain_frontiers.contains_key(&p) {
+                        let p_exists = self.store.has_object(&p).map_err(VerifyError::from_store)?;
+                        if !p_exists {
                             return Err(VerifyError::incomplete(if cur_is_shallow {
                                 format!(
                                     "shallow boundary at plain commit {} cuts across unsealed history (missing parent {})",
@@ -572,11 +620,12 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
                                 format!("missing commit object {}", to_hex(&p))
                             }));
                         }
-                        stack.push((p, false));
-                    } else {
                         let ppc = self.load_commit(p)?;
                         if matches!(ppc.class, CommitClass::Sealed { .. }) {
-                            discovered_sealed.push(p);
+                            let pd = self.keys.hash_sealed_commit(&ppc.raw);
+                            self.cache.put_commit(p, pd);
+                        } else {
+                            stack.push((p, false));
                         }
                     }
                 }
@@ -588,31 +637,38 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
                 let mut buf = Vec::with_capacity(32 + 4 + pc.parents.len() * 32 + pc.raw.len());
                 buf.extend_from_slice(&tree_dig);
                 buf.extend_from_slice(&k_u32.to_le_bytes());
-                for p in &pc.parents {
-                    buf.extend_from_slice(&self.cache.commits[p]);
+
+                let mut frontier_set: HashSet<Oid> = HashSet::new();
+                let mut frontier_vec: Vec<Oid> = Vec::new();
+                for &p in &pc.parents {
+                    buf.extend_from_slice(&self.cache.get_commit(&p).unwrap());
+                    let ppc = self.load_commit(p)?;
+                    if matches!(ppc.class, CommitClass::Sealed { .. }) {
+                        if frontier_set.insert(p) {
+                            frontier_vec.push(p);
+                        }
+                    } else if let Some(pf) = self.plain_frontiers.get(&p) {
+                        for &sc in pf {
+                            if frontier_set.insert(sc) {
+                                frontier_vec.push(sc);
+                            }
+                        }
+                    }
                 }
                 buf.extend_from_slice(&pc.raw);
                 let d = self.keys.hash_plain_commit(&buf);
                 self.cache.put_commit(cur, d);
+                self.plain_frontiers.insert(cur, frontier_vec);
             }
         }
 
-        Ok((self.cache.commits[&root_oid], discovered_sealed))
+        let d = self.cache.get_commit(&root_oid).unwrap();
+        let f = self.plain_frontiers.get(&root_oid).cloned().unwrap_or_default();
+        Ok((d, f))
     }
 }
 
-/// Extract `+blake3-<64-hex>` embedded in a tag or ref name, e.g.
-/// `refs/tags/v2.4.0+blake3-71e4...` or `v2.4.0+blake3-71e4...`.
-///
-/// Contract:
-/// - `requires`: true
-/// - `ensures`:
-///   - If `ref_or_name` contains zero occurrences of `"+blake3-"`, returns `Ok(None)`.
-///   - If `ref_or_name` contains `>= 2` occurrences of `"+blake3-"`, returns `Err(Mismatch)`
-///     (prevents duplicate-segment confusion such as `v1+blake3-<good>+blake3-<evil>`).
-///   - If `ref_or_name` contains exactly 1 `"+blake3-"`, parses the token up to the next `'+'` or `'/'`
-///     (or `^{}` peel suffix) as 64 lowercase hex chars (`[0-9a-f]{64}`), returning `Ok(Some(dig))` or `Err(Mismatch)`.
-/// - `writes`: nothing.
+/// Extract `+blake3-<64-hex>` embedded in a canonical ref/tag name (never a `^`/`~` revision walk!).
 pub fn parse_ref_embedded_b3(ref_or_name: &str) -> Result<Option<Dig>, VerifyError> {
     let mut matches = ref_or_name.match_indices("+blake3-");
     let Some((idx, _)) = matches.next() else {
@@ -624,8 +680,15 @@ pub fn parse_ref_embedded_b3(ref_or_name: &str) -> Result<Option<Dig>, VerifyErr
         )));
     }
     let rest = &ref_or_name[idx + "+blake3-".len()..];
+    // Reject revision-traversal suffixes (`~`, `^1`, `^{tree}`, `:path`) on a pinned ref name so a pin's
+    // digest can never be accidentally checked against a derived ancestor/subtree! Only exact `^{}` tag-peel is allowed.
     let rest = rest.strip_suffix("^{}").unwrap_or(rest);
-    let token = rest.split(['+', '/', '^', '~']).next().unwrap_or(rest);
+    if rest.contains(['^', '~', ':']) {
+        return Err(VerifyError::mismatch(format!(
+            "revision traversal operator on +blake3- ref {ref_or_name:?} is ambiguous; pass the exact ref name"
+        )));
+    }
+    let token = rest.split(['+', '/']).next().unwrap_or(rest);
     let dig = hex_to_32(token.as_bytes()).map_err(|e| {
         VerifyError::mismatch(format!(
             "malformed +blake3- digest in ref {ref_or_name:?}: {e}"
@@ -634,64 +697,164 @@ pub fn parse_ref_embedded_b3(ref_or_name: &str) -> Result<Option<Dig>, VerifyErr
     Ok(Some(dig))
 }
 
-/// Parse optional `Buttress-Object: blake3 <target-sha1> <64-hex>` trailer from an annotated tag.
+/// Parse an annotated tag strictly matching upstream Git `tag.c:parse_tag_buffer` & `fsck_tag_standalone`:
+///   Line 1 MUST be `object <40-hex>`
+///   Line 2 MUST be `type <blob|tree|commit|tag>`
+///   Line 3 MUST be `tag <non-empty-name>`
+///   Optional Line 4 `tagger ...`, and NO duplicate/unknown extra headers!
+/// Also strips only a genuine terminal PGP/SSH signature block from the body and parses
+/// `Buttress-Object: <alg> <target-sha1> <64-hex>` at the byte level.
 pub fn parse_annotated_tag(raw: &[u8]) -> Result<(Oid, ObjKind, Option<Dig>), VerifyError> {
     let (header, body) = split_headers_body(raw);
-    let mut target_oid: Option<Oid> = None;
-    let mut target_kind: Option<ObjKind> = None;
-    for line in header.split(|&c| c == b'\n') {
-        if let Some(rest) = line.strip_prefix(b"object ") {
-            target_oid = Some(
-                hex_to_oid(rest)
-                    .map_err(|e| VerifyError::mismatch(format!("tag bad object header: {e}")))?,
-            );
-        } else if let Some(rest) = line.strip_prefix(b"type ") {
-            target_kind = Some(ObjKind::from_bytes(rest).map_err(VerifyError::mismatch)?);
-        }
+    if header.contains(&0) {
+        return Err(VerifyError::mismatch("annotated tag: NUL byte in header"));
     }
-    let target_oid = target_oid.ok_or_else(|| VerifyError::mismatch("tag missing object line"))?;
-    let target_kind = target_kind.ok_or_else(|| VerifyError::mismatch("tag missing type line"))?;
+    let mut lines = header.split(|&c| c == b'\n');
 
-    let body_str = String::from_utf8_lossy(body);
-    let mut unsigned_body = body_str.as_ref();
-    for marker in ["-----BEGIN PGP SIGNATURE-----", "-----BEGIN SSH SIGNATURE-----"] {
-        if let Some(pos) = unsigned_body.find(marker) {
-            unsigned_body = &unsigned_body[..pos];
-            break;
-        }
+    // Line 1: `object <40-hex>`
+    let line1 = lines
+        .next()
+        .ok_or_else(|| VerifyError::mismatch("annotated tag: empty header"))?;
+    let obj_hex = line1
+        .strip_prefix(b"object ")
+        .ok_or_else(|| VerifyError::mismatch("annotated tag: first line must be 'object <oid>'"))?;
+    let target_oid = hex_to_oid(obj_hex)
+        .map_err(|e| VerifyError::mismatch(format!("annotated tag: invalid object OID: {e}")))?;
+
+    // Line 2: `type <kind>`
+    let line2 = lines
+        .next()
+        .ok_or_else(|| VerifyError::mismatch("annotated tag: missing 'type' line"))?;
+    let type_bytes = line2
+        .strip_prefix(b"type ")
+        .ok_or_else(|| VerifyError::mismatch("annotated tag: second line must be 'type <kind>'"))?;
+    let target_kind = ObjKind::from_bytes(type_bytes).map_err(VerifyError::mismatch)?;
+
+    // Line 3: `tag <non-empty-name>`
+    let line3 = lines
+        .next()
+        .ok_or_else(|| VerifyError::mismatch("annotated tag: missing 'tag' line"))?;
+    let tag_name = line3
+        .strip_prefix(b"tag ")
+        .ok_or_else(|| VerifyError::mismatch("annotated tag: third line must be 'tag <name>'"))?;
+    if tag_name.is_empty() {
+        return Err(VerifyError::mismatch("annotated tag: empty tag name"));
     }
+
+    // Optional `tagger ...` and optional `gpgsig`/`gpgsig-sha256` header, rejecting any extra/duplicate headers!
+    let mut saw_tagger = false;
+    let mut in_gpgsig = false;
+    for rem_line in lines {
+        if in_gpgsig && rem_line.starts_with(b" ") {
+            continue;
+        }
+        in_gpgsig = false;
+        if !saw_tagger && rem_line.starts_with(b"tagger ") {
+            saw_tagger = true;
+            continue;
+        }
+        if rem_line.starts_with(b"gpgsig ") || rem_line.starts_with(b"gpgsig-sha256 ") {
+            in_gpgsig = true;
+            continue;
+        }
+        return Err(VerifyError::mismatch(
+            "annotated tag: unexpected or duplicate header line (violates Git fsck_tag)",
+        ));
+    }
+
+    let unsigned_body = strip_terminal_signature_block(body);
 
     let mut found: Vec<Dig> = Vec::new();
-    for line in unsigned_body.lines() {
+    for raw_line in unsigned_body.split(|&c| c == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line == b"Buttress-Object:"
+            || (line.starts_with(b"Buttress-Object:") && !line.starts_with(TAG_TRAILER_PREFIX))
+        {
+            return Err(VerifyError::mismatch(
+                "malformed Buttress-Object trailer spacing",
+            ));
+        }
         if let Some(rest) = line.strip_prefix(TAG_TRAILER_PREFIX) {
-            let parts: Vec<&str> = rest.trim().split(' ').collect();
-            if parts.is_empty() || !is_valid_alg_token(parts[0].as_bytes()) {
-                return Err(VerifyError::mismatch("malformed Buttress-Object trailer"));
+            let parts: Vec<&[u8]> = rest.split(|&c| c == b' ').collect();
+            if parts.is_empty() || !is_valid_alg_token(parts[0]) {
+                return Err(VerifyError::mismatch("malformed Buttress-Object algorithm"));
             }
-            if parts[0] != "blake3" {
+            if parts[0] != b"blake3" {
                 continue;
             }
             if parts.len() != 3 {
                 return Err(VerifyError::mismatch(
-                    "malformed Buttress-Object blake3 trailer",
+                    "malformed Buttress-Object blake3 trailer (expected `<alg> <oid> <digest>`)",
                 ));
             }
-            let t_oid = hex_to_oid(parts[1].as_bytes())
+            let t_oid = hex_to_oid(parts[1])
                 .map_err(|e| VerifyError::mismatch(format!("bad tag trailer OID: {e}")))?;
             if t_oid != target_oid {
                 return Err(VerifyError::mismatch(
                     "tag Buttress-Object OID does not match tag object header",
                 ));
             }
-            let dig = hex_to_32(parts[2].as_bytes())
+            let dig = hex_to_32(parts[2])
                 .map_err(|e| VerifyError::mismatch(format!("bad tag trailer digest: {e}")))?;
             found.push(dig);
         }
     }
     if found.len() > 1 {
-        return Err(VerifyError::mismatch("duplicate Buttress-Object blake3 trailers"));
+        return Err(VerifyError::mismatch(
+            "duplicate Buttress-Object blake3 trailers",
+        ));
     }
     Ok((target_oid, target_kind, found.into_iter().next()))
+}
+
+/// Strip ONLY a genuine line-anchored terminal PGP/SSH/CMS signature block at the very end of `body`
+/// (matching Git `gpg-interface.c:parse_signature`), so prose mentioning `-----BEGIN PGP SIGNATURE-----`
+/// earlier in a tag message never truncates the body!
+fn strip_terminal_signature_block(body: &[u8]) -> &[u8] {
+    const BLOCKS: &[(&[u8], &[u8])] = &[
+        (
+            b"-----BEGIN PGP SIGNATURE-----",
+            b"-----END PGP SIGNATURE-----",
+        ),
+        (
+            b"-----BEGIN SSH SIGNATURE-----",
+            b"-----END SSH SIGNATURE-----",
+        ),
+        (
+            b"-----BEGIN PGP MESSAGE-----",
+            b"-----END PGP MESSAGE-----",
+        ),
+        (
+            b"-----BEGIN SIGNED MESSAGE-----",
+            b"-----END SIGNED MESSAGE-----",
+        ),
+    ];
+
+    let trimmed = body.trim_ascii_end();
+    for &(begin_marker, end_marker) in BLOCKS {
+        if !trimmed.ends_with(end_marker) {
+            continue;
+        }
+        // Find the last line-anchored `begin_marker` prior to the terminal `end_marker`
+        let mut search_end = trimmed.len() - end_marker.len();
+        while let Some(rel) = trimmed[..search_end]
+            .windows(begin_marker.len())
+            .rposition(|w| w == begin_marker)
+        {
+            let at_line_start = rel == 0 || trimmed[rel - 1] == b'\n';
+            let after = rel + begin_marker.len();
+            let valid_line_end =
+                after == trimmed.len() || trimmed[after] == b'\n' || trimmed[after] == b'\r';
+            if at_line_start && valid_line_end {
+                return &body[..rel];
+            }
+            if rel == 0 {
+                break;
+            }
+            search_end = rel;
+        }
+    }
+    body
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -706,11 +869,12 @@ pub enum CheckOutcome {
     NoEvidence {
         target_oid: Oid,
         digest: Dig,
+        ancestors_sealed_checked: usize,
     },
 }
 
 #[inline]
-fn ct_eq(a: &Dig, b: &Dig) -> bool {
+pub fn ct_eq(a: &Dig, b: &Dig) -> bool {
     let mut diff = 0u8;
     for i in 0..32 {
         diff |= a[i] ^ b[i];
@@ -718,8 +882,7 @@ fn ct_eq(a: &Dig, b: &Dig) -> bool {
     diff == 0
 }
 
-/// Full verification per `BUTTRESS.md` §5.
-/// NEVER reads any on-disk cache: recomputes every digest from raw stored objects.
+/// Shared, memoized verifier across one or more refs in a single repository snapshot (`fsck` / `prepared` hook).
 pub fn verify_target<S: ObjectStore>(
     store: &mut S,
     keys: &ContextKeys,
@@ -728,6 +891,28 @@ pub fn verify_target<S: ObjectStore>(
     explicit_expect: Option<Dig>,
     allow_shallow: bool,
 ) -> Result<CheckOutcome, VerifyError> {
+    let mut engine = Engine::new(store, keys, DigestCache::memory_only());
+    verify_target_with_engine(
+        &mut engine,
+        start_oid,
+        ref_hint,
+        explicit_expect,
+        allow_shallow,
+    )
+}
+
+/// Verify a target using an existing fresh-memory `Engine` so multi-ref `fsck` and `prepared`
+/// hook runs reuse verified subgraphs instead of re-traversing history `O(refs * commits)` times!
+pub fn verify_target_with_engine<S: ObjectStore>(
+    engine: &mut Engine<'_, S>,
+    start_oid: Oid,
+    ref_hint: Option<&str>,
+    explicit_expect: Option<Dig>,
+    allow_shallow: bool,
+) -> Result<CheckOutcome, VerifyError> {
+    if engine.cache.get_blob(&[0; 20]).is_none() {
+        // Note: `engine` MUST be constructed with `DigestCache::memory_only()` by callers.
+    }
     let ref_expect = match ref_hint {
         Some(r) => parse_ref_embedded_b3(r)?,
         None => None,
@@ -742,19 +927,28 @@ pub fn verify_target<S: ObjectStore>(
         }
     }
     let mut expect = explicit_expect.or(ref_expect);
+    let pinned_expect = expect.is_some();
 
-    let (mut cur_kind, raw) = store
+    let (mut cur_kind, raw) = engine
+        .store
         .read_object(&start_oid)
-        .map_err(VerifyError::incomplete)?
+        .map_err(VerifyError::from_store)?
         .ok_or_else(|| VerifyError::incomplete(format!("missing object {}", to_hex(&start_oid))))?;
     let mut target_oid = start_oid;
 
-    // Peel annotated tag(s), guarding against cyclic tag chains!
+    // Peel annotated tag(s) using canonical Git tag rules + cycle detection!
+    // For nested tags (`outer -> inner -> target`), a `Buttress-Object` trailer on an outer tag
+    // targeting `inner` (`type tag`) is disallowed unless it has no trailer; trailers bind leaf non-tag objects.
     let mut raw_cur = raw;
     let mut seen_tags: HashSet<Oid> = HashSet::new();
     seen_tags.insert(start_oid);
     while cur_kind == ObjKind::Tag {
         let (next_oid, decl_kind, trailer_dig) = parse_annotated_tag(&raw_cur)?;
+        if decl_kind == ObjKind::Tag && trailer_dig.is_some() {
+            return Err(VerifyError::mismatch(
+                "Buttress-Object trailer on a tag-to-tag object is ambiguous; attach trailer to the tag naming the non-tag target",
+            ));
+        }
         if let (Some(exp), Some(td)) = (expect, trailer_dig) {
             if !ct_eq(&exp, &td) {
                 return Err(VerifyError::mismatch(format!(
@@ -768,9 +962,31 @@ pub fn verify_target<S: ObjectStore>(
             expect = trailer_dig;
         }
         target_oid = next_oid;
-        let (actual_kind, r2) = store
+
+        // If the target is a Blob, verify its kind via `hash_blob` streaming without loading multi-GB into RAM!
+        if decl_kind == ObjKind::Blob {
+            let (actual_kind, _) = engine
+                .store
+                .hash_blob(&target_oid, engine.keys)
+                .map_err(VerifyError::from_store)?
+                .ok_or_else(|| {
+                    VerifyError::incomplete(format!("missing tagged blob {}", to_hex(&target_oid)))
+                })?;
+            if actual_kind != ObjKind::Blob {
+                return Err(VerifyError::mismatch(format!(
+                    "tag declared target type blob, but object {} is {}",
+                    to_hex(&target_oid),
+                    actual_kind.as_str()
+                )));
+            }
+            cur_kind = ObjKind::Blob;
+            break;
+        }
+
+        let (actual_kind, r2) = engine
+            .store
             .read_object(&target_oid)
-            .map_err(VerifyError::incomplete)?
+            .map_err(VerifyError::from_store)?
             .ok_or_else(|| {
                 VerifyError::incomplete(format!("missing tagged object {}", to_hex(&target_oid)))
             })?;
@@ -794,7 +1010,8 @@ pub fn verify_target<S: ObjectStore>(
         }
     }
 
-    let mut engine = Engine::new(store, keys, DigestCache::memory_only());
+    // If a tag trailer supplied `expect`, treat it as an explicit pin on the target too!
+    let effective_allow_shallow = allow_shallow && !pinned_expect;
 
     match cur_kind {
         ObjKind::Blob => {
@@ -816,6 +1033,7 @@ pub fn verify_target<S: ObjectStore>(
                 None => Ok(CheckOutcome::NoEvidence {
                     target_oid,
                     digest: actual,
+                    ancestors_sealed_checked: 0,
                 }),
             }
         }
@@ -838,6 +1056,7 @@ pub fn verify_target<S: ObjectStore>(
                 None => Ok(CheckOutcome::NoEvidence {
                     target_oid,
                     digest: actual,
+                    ancestors_sealed_checked: 0,
                 }),
             }
         }
@@ -856,13 +1075,11 @@ pub fn verify_target<S: ObjectStore>(
                         to_hex(&root_dig)
                     )));
                 }
-            } else if !root_is_sealed {
-                return Ok(CheckOutcome::NoEvidence {
-                    target_oid,
-                    digest: root_dig,
-                });
             }
 
+            // CRITICAL (H2 fix): Walk and verify ALL reachable sealed ancestors EVEN when `root_pc`
+            // is Plain/Stale with `expect == None`! Contradictory ancestor evidence MUST ALWAYS
+            // raise `Err(Mismatch)` rather than being hidden behind an early `NoEvidence` return!
             let mut queue: VecDeque<Oid> = VecDeque::new();
             let mut seen_sealed: HashSet<Oid> = HashSet::new();
             if root_is_sealed {
@@ -878,6 +1095,7 @@ pub fn verify_target<S: ObjectStore>(
             let mut shallow_stops = 0usize;
 
             while let Some(cur) = queue.pop_front() {
+                let already_verified_in_run = engine.verified_seals.contains(&cur);
                 let pc = engine.load_commit(cur)?;
                 let CommitClass::Sealed {
                     expected_tree,
@@ -887,28 +1105,28 @@ pub fn verify_target<S: ObjectStore>(
                     unreachable!("only sealed commits enter verification queue");
                 };
 
-                let actual_tree = engine.digest_tree(pc.tree)?;
-                if !ct_eq(&actual_tree, &expected_tree) {
-                    return Err(VerifyError::mismatch(format!(
-                        "MISMATCH at commit {} (directory {}):\n  directory expected: {}\n  directory actual:   {}",
-                        to_hex(&cur),
-                        to_hex(&pc.tree),
-                        to_hex(&expected_tree),
-                        to_hex(&actual_tree)
-                    )));
+                if !already_verified_in_run {
+                    let actual_tree = engine.digest_tree(pc.tree)?;
+                    if !ct_eq(&actual_tree, &expected_tree) {
+                        return Err(VerifyError::mismatch(format!(
+                            "MISMATCH at commit {} (directory {}):\n  directory expected: {}\n  directory actual:   {}",
+                            to_hex(&cur),
+                            to_hex(&pc.tree),
+                            to_hex(&expected_tree),
+                            to_hex(&actual_tree)
+                        )));
+                    }
                 }
 
                 let cur_is_shallow_boundary = engine.store.shallow_commits().contains(&cur);
+                let mut cur_had_shallow_skip = false;
                 for (&p_oid, exp_p_dig) in pc.parents.iter().zip(expected_parents.iter()) {
                     if cur_is_shallow_boundary
-                        && engine
-                            .store
-                            .read_object(&p_oid)
-                            .map_err(VerifyError::incomplete)?
-                            .is_none()
+                        && !engine.store.has_object(&p_oid).map_err(VerifyError::from_store)?
                     {
-                        if allow_shallow {
+                        if effective_allow_shallow {
                             shallow_stops += 1;
+                            cur_had_shallow_skip = true;
                             continue;
                         }
                         return Err(VerifyError::incomplete(format!(
@@ -919,7 +1137,7 @@ pub fn verify_target<S: ObjectStore>(
                     }
 
                     let (actual_p_dig, under_sealed) = engine.digest_commit(p_oid)?;
-                    if !ct_eq(&actual_p_dig, exp_p_dig) {
+                    if !already_verified_in_run && !ct_eq(&actual_p_dig, exp_p_dig) {
                         return Err(VerifyError::mismatch(format!(
                             "MISMATCH at parent {} of commit {}:\n  parent expected: {}\n  parent actual:   {}",
                             to_hex(&p_oid),
@@ -939,6 +1157,18 @@ pub fn verify_target<S: ObjectStore>(
                         }
                     }
                 }
+
+                if !cur_had_shallow_skip {
+                    engine.verified_seals.insert(cur);
+                }
+            }
+
+            if expect.is_none() && !root_is_sealed {
+                return Ok(CheckOutcome::NoEvidence {
+                    target_oid,
+                    digest: root_dig,
+                    ancestors_sealed_checked: seen_sealed.len(),
+                });
             }
 
             let plain_covered = engine
@@ -960,7 +1190,7 @@ pub fn verify_target<S: ObjectStore>(
 }
 
 /// Strip existing `buttress-tree blake3`, `buttress-parent blake3`, and `gpgsig*` lines
-/// from raw commit header bytes, preserving all other headers (including unknown algorithms).
+/// (including any continuation lines) from raw commit header bytes.
 pub fn strip_blake3_and_sig_headers(header_bytes: &[u8]) -> Vec<Vec<u8>> {
     let mut kept: Vec<Vec<u8>> = Vec::new();
     let mut skip_continuation = false;
@@ -972,13 +1202,12 @@ pub fn strip_blake3_and_sig_headers(header_bytes: &[u8]) -> Vec<Vec<u8>> {
             continue;
         }
         skip_continuation = false;
-        if line.starts_with(b"gpgsig ") || line.starts_with(b"gpgsig-sha256 ") {
-            skip_continuation = true;
-            continue;
-        }
-        if line.starts_with(b"buttress-tree blake3 ")
+        if line.starts_with(b"gpgsig ")
+            || line.starts_with(b"gpgsig-sha256 ")
+            || line.starts_with(b"buttress-tree blake3 ")
             || line.starts_with(b"buttress-parent blake3 ")
         {
+            skip_continuation = true;
             continue;
         }
         kept.push(line.to_vec());

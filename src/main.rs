@@ -1,14 +1,15 @@
 use git_buttress::cache::DigestCache;
 use git_buttress::git::{GitRepo, ObjKind, ObjectStore, hex_to_32, to_hex};
 use git_buttress::hooks::{
-    MissingPolicy, disable_buttress, enable_buttress, fsck_all_refs, run_git_wrapper,
-    run_reference_transaction_hook, seal_head,
+    MissingPolicy, disable_buttress, enable_buttress, fsck_all_refs, run_git_wrapper_os,
+    run_reference_transaction_hook, sanitize_for_tty, seal_head,
 };
 use git_buttress::protocol::{
-    CheckOutcome, CommitClass, ContextKeys, Engine, VerifyError, parse_annotated_tag,
-    split_headers_body, verify_target,
+    CheckOutcome, CommitClass, ContextKeys, Engine, VerifyError, VerifyErrorKind,
+    parse_annotated_tag, split_headers_body, verify_target,
 };
 use std::env;
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -26,17 +27,31 @@ USAGE:
 ";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+    let os_args: Vec<OsString> = env::args_os().skip(1).collect();
+    if os_args.is_empty() {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+
+    // Handle `__wrap-git` with raw `OsString`s BEFORE UTF-8 conversion so non-UTF-8 paths passed
+    // to any `git` command never panic (`H8.3` fix)!
+    if os_args[0] == "__wrap-git" {
+        let code = run_git_wrapper_os(&os_args[1..]);
+        return exit_code_from_status(code);
+    }
+
+    let args: Result<Vec<String>, _> = os_args.into_iter().map(|a| a.into_string()).collect();
+    let Ok(args) = args else {
+        eprintln!("git-buttress: error: command-line argument is not valid UTF-8");
+        return ExitCode::from(1);
+    };
+
+    if args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
 
     match args[0].as_str() {
-        "__wrap-git" => {
-            let code = run_git_wrapper(&args[1..]);
-            exit_code_from_status(code)
-        }
         "__hook-reference-transaction" => {
             let phase = args.get(1).map(|s| s.as_str()).unwrap_or("");
             match run_reference_transaction_hook(phase) {
@@ -57,10 +72,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Contract:
-/// - `requires`: true
-/// - `ensures`: returns `ExitCode::SUCCESS` iff `code == 0`; any non-zero `i32` (including `256` or negative)
-///   maps to a non-zero `ExitCode` (never wraps mod 256 to `0`!).
 fn exit_code_from_status(code: i32) -> ExitCode {
     if code == 0 {
         ExitCode::SUCCESS
@@ -167,7 +178,10 @@ fn cmd_disable(args: &[String]) -> Result<i32, String> {
         global = true;
     }
     disable_buttress(global, bin_dir)?;
-    println!("Disabled git-buttress ({})", if global { "global" } else { "local" });
+    println!(
+        "Disabled git-buttress ({})",
+        if global { "global" } else { "local" }
+    );
     Ok(0)
 }
 
@@ -189,13 +203,46 @@ fn cmd_id(args: &[String]) -> Result<i32, String> {
 
     loop {
         let (kind, raw) = repo
-            .read_object(&oid)?
+            .read_object(&oid)
+            .map_err(|e| e.message)?
             .ok_or_else(|| format!("missing object {}", to_hex(&oid)))?;
         match kind {
             ObjKind::Tag => {
-                let (next_oid, _, _) = parse_annotated_tag(&raw).map_err(|e| e.message)?;
+                let (next_oid, decl_kind, _) =
+                    parse_annotated_tag(&raw).map_err(|e| e.message)?;
                 if !seen_tags.insert(next_oid) {
-                    return Err(format!("cycle in annotated tag chain at {}", to_hex(&next_oid)));
+                    return Err(format!(
+                        "cycle in annotated tag chain at {}",
+                        to_hex(&next_oid)
+                    ));
+                }
+                // Check declared target kind matches stored object kind!
+                if decl_kind == ObjKind::Blob {
+                    let (actual_kind, d) = repo
+                        .hash_blob(&next_oid, &keys)
+                        .map_err(|e| e.message)?
+                        .ok_or_else(|| format!("missing object {}", to_hex(&next_oid)))?;
+                    if actual_kind != ObjKind::Blob {
+                        return Err(format!(
+                            "tag declared target type blob, but object {} is {}",
+                            to_hex(&next_oid),
+                            actual_kind.as_str()
+                        ));
+                    }
+                    println!("{}", to_hex(&d));
+                    return Ok(0);
+                }
+                let (actual_kind, _) = repo
+                    .read_object(&next_oid)
+                    .map_err(|e| e.message)?
+                    .ok_or_else(|| format!("missing object {}", to_hex(&next_oid)))?;
+                if actual_kind != decl_kind {
+                    return Err(format!(
+                        "tag declared target type {}, but object {} is {}",
+                        decl_kind.as_str(),
+                        to_hex(&next_oid),
+                        actual_kind.as_str()
+                    ));
                 }
                 oid = next_oid;
             }
@@ -231,10 +278,16 @@ fn cmd_check(args: &[String]) -> Result<i32, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--expect" => {
+                if expect_hex.is_some() {
+                    return Err("duplicate --expect option is not allowed".into());
+                }
                 i += 1;
                 expect_hex = Some(args.get(i).ok_or("--expect requires a 64-hex digest")?);
             }
             "--missing" => {
+                if missing_arg.is_some() {
+                    return Err("duplicate --missing option is not allowed".into());
+                }
                 i += 1;
                 missing_arg = Some(
                     args.get(i)
@@ -272,7 +325,18 @@ fn cmd_check(args: &[String]) -> Result<i32, String> {
             plain_covered,
             shallow_stops,
         }) => {
-            println!("MATCH {}", to_hex(&target_oid));
+            if shallow_stops > 0 && policy == MissingPolicy::Error {
+                eprintln!(
+                    "INCOMPLETE: {} stopped at {shallow_stops} shallow boundary parent(s) (buttress.missing=error)",
+                    to_hex(&target_oid)
+                );
+                return Ok(1);
+            }
+            if shallow_stops > 0 {
+                println!("PARTIAL MATCH {}", to_hex(&target_oid));
+            } else {
+                println!("MATCH {}", to_hex(&target_oid));
+            }
             println!("  blake3:         {}", to_hex(&digest));
             println!(
                 "  commits:        {} carrying lines, {} plain covered",
@@ -286,29 +350,36 @@ fn cmd_check(args: &[String]) -> Result<i32, String> {
             }
             Ok(0)
         }
-        Ok(CheckOutcome::NoEvidence { target_oid, digest }) => match policy {
+        Ok(CheckOutcome::NoEvidence {
+            target_oid,
+            digest,
+            ancestors_sealed_checked,
+        }) => match policy {
             MissingPolicy::Silent => Ok(0),
             MissingPolicy::Warn => {
                 eprintln!(
-                    "NO EVIDENCE for {} (computed blake3: {})",
+                    "NO EVIDENCE for {} (computed blake3: {}; {} ancestor seal(s) checked)",
                     to_hex(&target_oid),
-                    to_hex(&digest)
+                    to_hex(&digest),
+                    ancestors_sealed_checked
                 );
                 Ok(0)
             }
             MissingPolicy::Error => {
                 eprintln!(
-                    "NO EVIDENCE for {} (computed blake3: {})",
+                    "NO EVIDENCE for {} (computed blake3: {}; {} ancestor seal(s) checked)",
                     to_hex(&target_oid),
-                    to_hex(&digest)
+                    to_hex(&digest),
+                    ancestors_sealed_checked
                 );
                 Ok(2)
             }
         },
         Err(VerifyError { kind, message }) => {
             let label = match kind {
-                git_buttress::protocol::VerifyErrorKind::Mismatch => "MISMATCH",
-                git_buttress::protocol::VerifyErrorKind::Incomplete => "INCOMPLETE",
+                VerifyErrorKind::Mismatch => "MISMATCH",
+                VerifyErrorKind::Incomplete => "INCOMPLETE",
+                VerifyErrorKind::StoreFailure => "STORE FAILURE",
             };
             eprintln!("{label}: {message}");
             Ok(1)
@@ -322,6 +393,9 @@ fn cmd_fsck(args: &[String]) -> Result<i32, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--missing" => {
+                if missing_arg.is_some() {
+                    return Err("duplicate --missing option is not allowed".into());
+                }
                 i += 1;
                 missing_arg = Some(
                     args.get(i)
@@ -334,9 +408,7 @@ fn cmd_fsck(args: &[String]) -> Result<i32, String> {
     }
     let mut repo = GitRepo::open(None)?;
     let (matched, no_ev) = fsck_all_refs(&mut repo, missing_arg)?;
-    println!(
-        "buttress fsck: {matched} ref(s) verified, {no_ev} ref(s) without buttress lines"
-    );
+    println!("buttress fsck: {matched} ref(s) verified, {no_ev} ref(s) without buttress lines");
     Ok(0)
 }
 
@@ -372,11 +444,18 @@ fn cmd_log(args: &[String]) -> Result<i32, String> {
     let rev = rev.unwrap_or("HEAD");
 
     let mut repo = GitRepo::open(None)?;
-    let out = repo.run(["rev-list", &format!("-n{count}"), rev], None)?;
-    let oids: Vec<_> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| git_buttress::git::hex_to_oid(l.trim().as_bytes()).ok())
-        .collect();
+    let out = repo.run(
+        ["rev-list", &format!("-n{count}"), "--end-of-options", rev],
+        None,
+    )?;
+    let mut oids = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        oids.push(git_buttress::git::hex_to_oid(trimmed.as_bytes())?);
+    }
 
     let keys = ContextKeys::new();
     let mut engine = Engine::new(&mut repo, &keys, DigestCache::memory_only());
@@ -390,11 +469,12 @@ fn cmd_log(args: &[String]) -> Result<i32, String> {
         };
         let sig = if pc.has_gpgsig { " [sig]" } else { "" };
         let (_, body) = split_headers_body(&pc.raw);
-        let subj = String::from_utf8_lossy(body)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let subj = sanitize_for_tty(
+            String::from_utf8_lossy(body)
+                .lines()
+                .next()
+                .unwrap_or(""),
+        );
         println!(
             "{}  b3:{}  [{}]{}  {}",
             &to_hex(&oid)[..12],
@@ -418,7 +498,7 @@ fn cmd_seal_head(args: &[String]) -> Result<i32, String> {
         }
     }
     let mut repo = GitRepo::open(None)?;
-    if repo.config_bool("buttress.disabled", false) {
+    if repo.config_bool_strict("buttress.disabled", false)? {
         return Ok(0);
     }
     seal_head(&mut repo, sign, quiet)?;

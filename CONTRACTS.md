@@ -113,39 +113,44 @@ Over an acyclic subgraph in `objects(S)`:
 
 ### Type `DigestCache`
 
-* **Meaning:** `(blobs, trees, commits, pending, disk_path)` where the three
-  maps hold memoized `(Oid -> Dig)` entries.
+* **Meaning:** Private maps `(blobs, trees, commits)` holding memoized `(Oid -> Dig)`
+  entries, plus `pending` and `disk_path`.
 * **Invariant `I_cache(c)`:**
   1. `c.disk_path.is_none() ==> c.pending.is_empty()`.
-  2. Every `(kind, oid, dig)` in `c.pending` has `kind in {1, 2, 3}` and the
-     corresponding map (`blobs`, `trees`, or `commits`) maps `oid` to `dig`.
+  2. Consistent last-write-wins across memory and disk: whenever `put_{blob,tree,commit}(oid, dig)`
+     changes `map[oid]` (whether inserting a new `oid` or overwriting a different `dig`),
+     `(kind, oid, dig)` is appended to `c.pending` (when `c.disk_path.is_some()`), so
+     `flush()` followed by `load_from_git_dir()` yields the exact same maps as in memory.
+  3. Maps use Rust's randomized SipHash (`HashMap`) and are private.
 
 ```text
 contract DigestCache::memory_only() -> DigestCache
   requires true
-  ensures  I_cache(ret) and ret.disk_path == None and ret.blobs/trees/commits/pending all empty
+  ensures  I_cache(ret) and ret.disk_path == None and all maps/pending empty
   writes   —
 
 contract DigestCache::load_from_git_dir(git_dir: &Path) -> DigestCache
   requires true
   ensures  I_cache(ret) and ret.disk_path == Some(git_dir.join("buttress-cache.bin"))
            and ret.pending.is_empty();
+           refuses symlinks/non-regular files and files > 256 MiB;
            if file begins with b"BTRSC001", loads floor((len - 8) / 53) complete records
-           (later records for the same (kind, oid) overwrite earlier ones; unknown kind bytes ignored);
-           missing/unreadable/bad-magic files yield empty maps without error
+           (last-write-wins per (kind, oid)); missing/bad-magic files yield empty maps
   writes   —
 
 contract DigestCache::put_{blob,tree,commit}(self: &mut DigestCache, oid: Oid, dig: Dig)
   requires I_cache(self)
-  ensures  I_cache(self) and map.contains_key(&oid);
-           if old(!map.contains_key(&oid)), map[&oid] == dig and (if disk_path.is_some(), appended to pending)
+  ensures  I_cache(self) and self.get_{blob|tree|commit}(&oid) == Some(dig);
+           if old(self.get_*(oid)) != Some(dig) and self.disk_path.is_some(),
+           appends (kind, oid, dig) to self.pending
   writes   self.{blobs|trees|commits}, self.pending
 
 contract DigestCache::flush(self: &mut DigestCache)
   requires I_cache(self)
   ensures  I_cache(self) and self.pending.is_empty();
-           if self.disk_path == Some(p) and !old(self.pending).is_empty(), best-effort writes records
-           after repairing any missing header or truncating any torn (len - 8) % 53 != 0 tail on p
+           if self.disk_path == Some(p) and !old(self.pending).is_empty(), opens p with O_NOFOLLOW
+           (refusing symlinks) and writes records via a single owned handle after verifying/truncating
+           any torn (len - 8) % 53 != 0 tail
   writes   self.pending, filesystem[p]
 ```
 
@@ -237,25 +242,27 @@ contract parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyErro
 contract parse_tree_entries(raw: &[u8]) -> Result<Vec<(&[u8], u32, &[u8], Oid)>, VerifyError>
   requires true
   ensures  Ok(v) <==> raw is exact concatenation of `mode || b" " || name || b"\0" || child` where
-           1 <= mode.len() <= 7, mode in [b'0'..=b'7']+, !name.is_empty(), !name.contains(0), !name.contains(b'/'),
-           and child.len() == 20; Err(Mismatch) otherwise
+           1 <= mode.len() <= 7, octal(mode) in {040000, 100644, 100664, 100755, 120000, 160000},
+           name not in {"", ".", "..", ".git" (case-insensitive)}, !name.contains(0), !name.contains(b'/'),
+           all entry names in the tree are distinct, and child.len() == 20; Err(Mismatch) otherwise
   writes   —
 
 contract parse_ref_embedded_b3(ref_or_name: &str) -> Result<Option<Dig>, VerifyError>
   requires true
   ensures  0 occurrences of "+blake3-" ==> Ok(None);
            >= 2 occurrences of "+blake3-" ==> Err(Mismatch);
-           1 occurrence ==> parses segment after "+blake3-" (stripping "^{}", stopping at '+', '/', '^', '~')
-             as 64 lowercase hex chars: Ok(Some(dig)) or Err(Mismatch)
+           1 occurrence ==> strips optional "^{}", rejects any '^'/'~'/':' revision walk suffix with Err(Mismatch),
+             and parses segment up to '+' or '/' as 64 lowercase hex chars: Ok(Some(dig)) or Err(Mismatch)
   writes   —
 
 contract parse_annotated_tag(raw: &[u8]) -> Result<(Oid, ObjKind, Option<Dig>), VerifyError>
   requires true
-  ensures  parses `object <40-hex>` and `type <kind>` from tag header, strips trailing PGP/SSH signature block
-           from body, and scans remaining lines for `Buttress-Object: <alg> ...`:
-           - non-`blake3` valid `<alg>` lines ignored;
-           - > 1 `blake3` trailers, malformed `blake3` trailer, or trailer OID != header `object` ==> Err(Mismatch);
-           - returns Ok((target_oid, target_kind, optional_blake3_digest))
+  ensures  strictly matches Git `tag.c:parse_tag_buffer` & `fsck_tag`:
+           line 1 `object <40-hex>`, line 2 `type <kind>`, line 3 `tag <non-empty>`, optional `tagger ...`
+           and optional `gpgsig*` (rejecting any duplicate/misordered/extra headers with Err(Mismatch));
+           strips only a genuine line-anchored terminal PGP/SSH/CMS signature block at the end of body;
+           scans remaining lines for `Buttress-Object: <alg> <oid> <64-hex>` (rejecting bad spacing, >1 blake3
+           trailers, or trailer OID != header `object` with Err(Mismatch))
   writes   —
 ```
 
@@ -272,31 +279,21 @@ contract verify_target<S: ObjectStore>(
 ) -> Result<CheckOutcome, VerifyError>
   requires true
   ensures
-    1. Uses DigestCache::memory_only() (never touches disk cache).
-    2. Combines expectations from `explicit_expect`, `parse_ref_embedded_b3(ref_hint)`, and any peeled
-       annotated tag `Buttress-Object: blake3` trailers; if any two present expectations disagree,
-       returns Err(Mismatch). Also verifies every peeled tag's declared `type` matches the actual object
-       kind in `store`, and rejects cyclic tag chains with Err(Mismatch).
-    3. For Blob/Tree target:
-       - If effective `expect == Some(exp)`: returns Ok(Match) iff `spec_{file|dir}(store, target) == exp`,
-         else Err(Mismatch) (or Err(Incomplete) if objects missing).
-       - If effective `expect == None`: returns Ok(NoEvidence) after computing `spec_{file|dir}` (still
-         catching malformed/missing objects in the target).
-    4. For Commit target `C_0`:
-       - Computes `(root_dig, initial_sealed) = digest_commit(C_0)`.
+    1. Uses DigestCache::memory_only() (never touches disk cache), streams blobs in 64 KiB chunks,
+       and distinguishes missing objects (`Err(Incomplete)`) from corrupt-store/I/O errors (`Err(StoreFailure)`).
+    2. Combines expectations from `explicit_expect`, `parse_ref_embedded_b3(ref_hint)`, and peeled
+       annotated tag `Buttress-Object: blake3` trailers (rejecting trailers on tag-to-tag links,
+       disagreeing expectations, declared-vs-actual `type` mismatches, and cyclic tag chains with Err(Mismatch)).
+       When `explicit_expect` or a `+blake3-` ref pin is supplied, `effective_allow_shallow` is forced `false`.
+    3. For Commit target `C_0`:
+       - Computes `(root_dig, initial_sealed) = digest_commit(C_0)` (whose returned `initial_sealed` frontier
+         is invariant across cold and warm `Engine` calls).
        - If `expect == Some(exp)` and `root_dig != exp`: returns Err(Mismatch).
-       - If `expect == None` and `C_0` is not `Sealed`: returns Ok(NoEvidence).
-       - Otherwise walks BFS over every reachable `Sealed` commit `C` (starting from `C_0` if `Sealed`
-         plus `initial_sealed`, and adding `Sealed` parents and `Sealed` ancestors beneath `Plain`/`Stale`
-         parents):
-         a) Verifies `spec_dir(store, C.tree) == C.expected_tree` in constant time, else Err(Mismatch).
-         b) For each `(P_i, exp_p_dig)`:
-            - If `P_i` is missing in `store` AND `C in store.shallow_commits()`:
-              if `allow_shallow` increments `shallow_stops` and continues; else returns Err(Incomplete).
-            - Otherwise computes `actual_p = digest_commit(P_i)` and verifies `actual_p == exp_p_dig`
-              in constant time, else Err(Mismatch).
-       - Returns Ok(Match { target_oid: C_0, digest: root_dig, sealed_checked, plain_covered, shallow_stops }).
-  writes store (via read_object only)
+       - Walks BFS over EVERY reachable `Sealed` commit `C` (EVEN when `C_0` is `Plain`/`Stale` and
+         `expect == None`! Contradictory ancestor seals ALWAYS return `Err(Mismatch)`).
+       - Only after all reachable seals pass: if `expect == None` and `C_0` is not `Sealed`, returns
+         `Ok(NoEvidence { target_oid, digest: root_dig, ancestors_sealed_checked })`; otherwise returns `Ok(Match)`.
+  writes store (via read_object / has_object / hash_blob only)
 ```
 
 ---
@@ -306,40 +303,29 @@ contract verify_target<S: ObjectStore>(
 ### Key Hook & Wrapper Contracts
 
 ```text
-contract posix_single_quote(s: &str) -> String
-  requires !s.contains('\0')
-  ensures  POSIX sh parses `ret` as a single literal word equal to `s` (no `$`, backtick, `\`, glob, or splitting)
-  writes   —
-
 contract seal_head(repo: &mut GitRepo, force_sign: bool, quiet: bool) -> Result<(Oid, Dig), String>
   requires I_repo(repo) and HEAD resolves to an existing commit `head_oid`
   ensures
-    - If `GIT_BUTTRESS_INTERNAL` is set in env: no-op, returns `(head_oid, [0; 32])`.
-    - If `head_oid` is already `Sealed` AND its `buttress-tree` and `buttress-parent` digests match
-      recomputed `digest_tree` / `digest_commit`: leaves `HEAD` unchanged (idempotent) and returns `(head_oid, dig)`.
-    - Otherwise builds a new commit preserving all non-`buttress-*-blake3`, non-`gpgsig*` headers and exact body,
-      appending valid `buttress-tree blake3` and `buttress-parent blake3` lines, re-signing if `force_sign || old.has_gpgsig`,
-      and atomically updating the current branch ref (or `--no-deref HEAD` if detached) from `head_oid` to `new_oid`
-      with `GIT_BUTTRESS_INTERNAL=1`.
-  writes repo object store, current branch ref / HEAD, `.git/buttress-cache.bin`, stderr (if !quiet)
+    - Captures exact `(sym_ref_or_detached, head_oid)` BEFORE hashing/signing.
+    - If `head_oid` is `Sealed`: verifies its existing claims against a fresh memory-only `Engine`;
+      if they contradict the store, returns `Err` (NEVER overwrites tampering evidence!).
+      If valid and (`!force_sign || old.has_gpgsig`), returns `(head_oid, dig)` unchanged.
+    - Uses `DigestCache::memory_only()` whenever signing (`force_sign || old.has_gpgsig`), verifies
+      `SIG_CREATED` / SSH armor on `sign_payload` via a mode-0700 exclusive temp dir, re-reads the
+      stored commit object after `hash-object -w` to confirm byte equality, verifies `HEAD` state has
+      not changed concurrently, and updates the exact branch ref (or `no-deref HEAD`) via `update-ref --stdin -z`
+      with a single-operation scoped token `GIT_BUTTRESS_INTERNAL_TX=seal-head:<old>:<new>`.
+  writes repo object store, target ref, `.git/buttress-cache.bin` (only when unsigned), stderr
 
-contract run_reference_transaction_hook(phase: &str) -> Result<(), String>
-  requires stdin contains Git reference-transaction lines `<old-oid> <new-oid> <refname>`
+contract enable_buttress / disable_buttress
   ensures
-    - If `GIT_BUTTRESS_INTERNAL` set, `phase not in {"prepared", "committed"}`, outside a SHA-1 Git repo,
-      or `buttress.disabled == true`: returns Ok(()).
-    - When `phase == "prepared"`: verifies every non-zero, non-symbolic update on `refs/remotes/*`,
-      `refs/tags/*`, or any ref containing `"+blake3-"` via `verify_target(..., allow_shallow=true)`:
-      * `Mismatch` ==> Err (aborts Git's ref transaction before refs/worktree commit).
-      * `Incomplete` ==> Err if ref has `"+blake3-"` or `buttress.missing == error`, else stderr note.
-      * `NoEvidence` ==> respects `buttress.missing` (`silent` / `warn` / `error`), suppressing warnings on
-        a plain tag when a companion `+blake3-` tag for the same OID is in the same transaction.
-    - When `phase == "committed"`: if `buttress.autotag` is explicitly `true` (default `false`) and
-      transaction is local (no `refs/remotes/*` updates and `GIT_REFLOG_ACTION` not `clone`/`fetch`/`pull`),
-      for each created/updated plain tag `refs/tags/<T>` without `"+blake3-"`, peels to target object,
-      computes its BLAKE3 digest `D`, and updates `refs/tags/<T>+blake3-<hex(D)>` to `<new-oid>` with
-      `GIT_BUTTRESS_INTERNAL=1`.
-  writes repo refs & `.git/buttress-cache.bin` (only in `committed` phase), stderr
+    - Saves prior `core.hooksPath` in `.buttress-prev-hooks-path` on first install and preserves it across
+      repeat `enable` runs; forwards all 28 standard `githooks(5)` hooks to any prior `core.hooksPath` or
+      `$GIT_COMMON_DIR/hooks/<name>` with binary-safe stdin replay and loop guards.
+    - Writes hook and wrapper scripts atomically via exclusive temp files (`create_new` + `rename`),
+      refusing to overwrite symlinks or unrelated `git` binaries.
+    - `disable` restores the saved prior `core.hooksPath` (if `core.hooksPath` still points to ours),
+      removes generated hook scripts and our wrapper, and sets local `buttress.disabled=true` on `--local`.
 ```
 
 ### CLI Exit-Code Contracts (`src/main.rs`)

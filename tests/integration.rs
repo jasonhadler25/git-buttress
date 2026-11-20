@@ -1,7 +1,7 @@
 //! Comprehensive integration & adversarial test suite for `git-buttress`.
 
 use git_buttress::cache::Oid;
-use git_buttress::git::{GitRepo, ObjKind, ObjectStore, hex_to_oid, to_hex};
+use git_buttress::git::{GitRepo, ObjKind, ObjectStore, StoreError, hex_to_oid, to_hex};
 use git_buttress::protocol::{
     CheckOutcome, ContextKeys, Engine, VerifyErrorKind, verify_target,
 };
@@ -134,7 +134,14 @@ struct PoisonedStore<'a> {
 }
 
 impl<'a> ObjectStore for PoisonedStore<'a> {
-    fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, String> {
+    fn has_object(&mut self, oid: &Oid) -> Result<bool, StoreError> {
+        if self.overrides.contains_key(oid) {
+            return Ok(true);
+        }
+        self.inner.has_object(oid)
+    }
+
+    fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, StoreError> {
         if let Some(v) = self.overrides.get(oid) {
             return Ok(Some(v.clone()));
         }
@@ -607,7 +614,13 @@ fn adversarial_sha1dc_collision_and_shallow_boundary_tests() {
             shallow: HashSet<Oid>,
         }
         impl<'b> ObjectStore for MissingParentStore<'b> {
-            fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, String> {
+            fn has_object(&mut self, oid: &Oid) -> Result<bool, StoreError> {
+                if *oid == self.missing {
+                    return Ok(false);
+                }
+                self.inner.has_object(oid)
+            }
+            fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, StoreError> {
                 if *oid == self.missing {
                     return Ok(None);
                 }
@@ -625,10 +638,12 @@ fn adversarial_sha1dc_collision_and_shallow_boundary_tests() {
             shallow: unrelated_shallow,
         };
         let err =
-            verify_target(&mut bad_shallow, &keys, tip_oid, None, Some(tip_b3), true).unwrap_err();
+            verify_target(&mut bad_shallow, &keys, tip_oid, None, None, true).unwrap_err();
         assert_eq!(err.kind, VerifyErrorKind::Incomplete);
 
-        // Whereas if `tip_oid` ITSELF is the declared shallow boundary, `--allow-shallow` succeeds and counts 1 stop:
+        // Whereas if `tip_oid` ITSELF is the declared shallow boundary:
+        // - unpinned `allow_shallow=true` succeeds and counts 1 stop;
+        // - explicitly pinned (`Some(tip_b3)`) fails closed on incomplete shallow history (`H4` fix)!
         let mut declared_shallow = HashSet::new();
         declared_shallow.insert(tip_oid);
         let mut good_shallow = MissingParentStore {
@@ -637,7 +652,7 @@ fn adversarial_sha1dc_collision_and_shallow_boundary_tests() {
             shallow: declared_shallow,
         };
         let ok =
-            verify_target(&mut good_shallow, &keys, tip_oid, None, Some(tip_b3), true).unwrap();
+            verify_target(&mut good_shallow, &keys, tip_oid, None, None, true).unwrap();
         assert!(matches!(
             ok,
             CheckOutcome::Match {
@@ -645,6 +660,9 @@ fn adversarial_sha1dc_collision_and_shallow_boundary_tests() {
                 ..
             }
         ));
+        let pinned_shallow_err =
+            verify_target(&mut good_shallow, &keys, tip_oid, None, Some(tip_b3), true).unwrap_err();
+        assert_eq!(pinned_shallow_err.kind, VerifyErrorKind::Incomplete);
     }
 }
 
@@ -696,7 +714,10 @@ fn contract_obligations_found_during_dbc_pass() {
         shallow: HashSet<Oid>,
     }
     impl ObjectStore for MapStore {
-        fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, String> {
+        fn has_object(&mut self, oid: &Oid) -> Result<bool, StoreError> {
+            Ok(self.objs.contains_key(oid))
+        }
+        fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, StoreError> {
             Ok(self.objs.get(oid).cloned())
         }
         fn shallow_commits(&self) -> &HashSet<Oid> {
@@ -760,14 +781,18 @@ fn contract_obligations_found_during_dbc_pass() {
     }
     {
         let mut c = git_buttress::cache::DigestCache::load_from_git_dir(&gd);
-        assert_eq!(c.blobs.get(&oid1), Some(&dig1));
+        assert_eq!(c.get_blob(&oid1), Some(dig1));
         c.put_tree(oid2, dig2);
         c.flush();
     }
     {
         let c = git_buttress::cache::DigestCache::load_from_git_dir(&gd);
-        assert_eq!(c.blobs.get(&oid1), Some(&dig1));
-        assert_eq!(c.trees.get(&oid2), Some(&dig2), "post-crash record must stay 53-byte aligned!");
+        assert_eq!(c.get_blob(&oid1), Some(dig1));
+        assert_eq!(
+            c.get_tree(&oid2),
+            Some(dig2),
+            "post-crash record must stay 53-byte aligned!"
+        );
     }
 
     // 7. POSIX shell quoting with hostile characters (`$`, `'`, spaces, backticks) & `git tag -f`
@@ -973,7 +998,10 @@ fn mutation_survivor_killing_suite() {
         shallow: HashSet<Oid>,
     }
     impl ObjectStore for MemStore {
-        fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, String> {
+        fn has_object(&mut self, oid: &Oid) -> Result<bool, StoreError> {
+            Ok(self.objs.contains_key(oid))
+        }
+        fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, StoreError> {
             Ok(self.objs.get(oid).cloned())
         }
         fn shallow_commits(&self) -> &HashSet<Oid> {
@@ -1154,13 +1182,13 @@ fn mutation_survivor_killing_suite() {
     fs::write(cdir.join("buttress-cache.bin"), b"BADMAGIC").unwrap();
     {
         let mut dc = git_buttress::cache::DigestCache::load_from_git_dir(&cdir);
-        assert!(dc.commits.is_empty());
+        assert_eq!(dc.get_commit(&[9; 20]), None);
         dc.put_commit([9; 20], [8; 32]);
         dc.flush();
     }
     {
         let dc = git_buttress::cache::DigestCache::load_from_git_dir(&cdir);
-        assert_eq!(dc.commits.get(&[9; 20]), Some(&[8; 32]));
+        assert_eq!(dc.get_commit(&[9; 20]), Some([8; 32]));
     }
     // Also test exact 8-byte valid magic (0 records):
     let cdir2 = sb.root.join("cache-empty-hdr");
@@ -1223,5 +1251,254 @@ fn mutation_survivor_killing_suite() {
     assert!(
         id_with_bad_env.status.success(),
         "resolve_real_git must skip wrapper even if GIT_BUTTRESS_REAL_GIT points to it!"
+    );
+}
+
+#[test]
+fn astra_audit_round1_regressions() {
+    let keys = ContextKeys::new();
+
+    // --- C1: Canonical Git annotated-tag header grammar (reject duplicate/misordered headers!) ---
+    let target_oid = [0x21u8; 20];
+    let evil_oid = [0x99u8; 20];
+    let target_hex = to_hex(&target_oid);
+    let evil_hex = to_hex(&evil_oid);
+
+    // Attack C1a: Two `object ` lines where Git uses the 1st and naive last-wins uses the 2nd!
+    let c1_dup_obj = format!(
+        "object {target_hex}\ntype commit\ntag v1\nobject {evil_hex}\n\nbody\n"
+    );
+    assert!(
+        git_buttress::protocol::parse_annotated_tag(c1_dup_obj.as_bytes()).is_err(),
+        "C1: duplicate object header in tag MUST be rejected!"
+    );
+
+    // Attack C1b: Missing `tag <name>` line or wrong `object`/`type`/`tag` order
+    let c1_missing_tag = format!("object {target_hex}\ntype commit\n\nbody\n");
+    assert!(git_buttress::protocol::parse_annotated_tag(c1_missing_tag.as_bytes()).is_err());
+    let c1_swapped = format!("type commit\nobject {target_hex}\ntag v1\n\nbody\n");
+    assert!(git_buttress::protocol::parse_annotated_tag(c1_swapped.as_bytes()).is_err());
+
+    // --- M4: Signature-marker in middle of tag prose MUST NOT truncate genuine trailer at end! ---
+    let good_dig = keys.hash_file(b"hello");
+    let good_hex = to_hex(&good_dig);
+    let tag_with_prose_marker = format!(
+        "object {target_hex}\ntype blob\ntag v1\ntagger T <t@e> 1 +0000\n\n\
+         Note: never paste -----BEGIN PGP SIGNATURE----- in prose!\n\n\
+         Buttress-Object: blake3 {target_hex} {good_hex}\n"
+    );
+    let (_, _, parsed_dig) =
+        git_buttress::protocol::parse_annotated_tag(tag_with_prose_marker.as_bytes()).unwrap();
+    assert_eq!(
+        parsed_dig,
+        Some(good_dig),
+        "M4: non-terminal marker in prose must not hide real Buttress-Object trailer!"
+    );
+
+    // --- H2: Unpinned plain/stale tip MUST still catch corrupted sealed ancestors! ---
+    struct SimpleStore(HashMap<Oid, (ObjKind, Vec<u8>)>, HashSet<Oid>);
+    impl ObjectStore for SimpleStore {
+        fn has_object(&mut self, k: &Oid) -> Result<bool, StoreError> {
+            Ok(self.0.contains_key(k))
+        }
+        fn read_object(&mut self, k: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, StoreError> {
+            Ok(self.0.get(k).cloned())
+        }
+        fn shallow_commits(&self) -> &HashSet<Oid> {
+            &self.1
+        }
+    }
+
+    let empty_tree = [0x10u8; 20];
+    let bad_sealed_anc = [0x11u8; 20];
+    let plain_tip = [0x12u8; 20];
+    let wrong_tree_dig = to_hex(&[0xeeu8; 32]); // DOES NOT MATCH empty_tree!
+    let anc_raw = format!(
+        "tree {}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\nbuttress-tree blake3 {} {}\n\nanc\n",
+        to_hex(&empty_tree),
+        to_hex(&empty_tree),
+        wrong_tree_dig
+    );
+    let tip_raw = format!(
+        "tree {}\nparent {}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\nplain tip\n",
+        to_hex(&empty_tree),
+        to_hex(&bad_sealed_anc)
+    );
+    let mut h2_store = SimpleStore(
+        HashMap::from([
+            (empty_tree, (ObjKind::Tree, Vec::new())),
+            (bad_sealed_anc, (ObjKind::Commit, anc_raw.into_bytes())),
+            (plain_tip, (ObjKind::Commit, tip_raw.into_bytes())),
+        ]),
+        HashSet::new(),
+    );
+    let h2_err = verify_target(&mut h2_store, &keys, plain_tip, None, None, true).unwrap_err();
+    assert_eq!(
+        h2_err.kind,
+        VerifyErrorKind::Mismatch,
+        "H2: unpinned plain tip MUST report Mismatch when a sealed ancestor is corrupted!"
+    );
+
+    // --- L1: `Engine::digest_commit` warm vs cold frontier equality (Astra's `frontier_contract.rs`!) ---
+    let good_anc = [0x13u8; 20];
+    let good_tip = [0x14u8; 20];
+    let good_anc_raw = format!(
+        "tree {}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\nbuttress-tree blake3 {} {}\n\nanc\n",
+        to_hex(&empty_tree),
+        to_hex(&empty_tree),
+        to_hex(&keys.hash_dir(&[]))
+    );
+    let good_tip_raw = format!(
+        "tree {}\nparent {}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\nnext\n",
+        to_hex(&empty_tree),
+        to_hex(&good_anc)
+    );
+    let mut l1_store = SimpleStore(
+        HashMap::from([
+            (empty_tree, (ObjKind::Tree, Vec::new())),
+            (good_anc, (ObjKind::Commit, good_anc_raw.into_bytes())),
+            (good_tip, (ObjKind::Commit, good_tip_raw.into_bytes())),
+        ]),
+        HashSet::new(),
+    );
+    let mut eng = Engine::new(
+        &mut l1_store,
+        &keys,
+        git_buttress::cache::DigestCache::memory_only(),
+    );
+    let cold = eng.digest_commit(good_tip).unwrap();
+    let warm = eng.digest_commit(good_tip).unwrap();
+    assert_eq!(
+        cold, warm,
+        "L1: cold and warm digest_commit calls must return identical (digest, frontier)!"
+    );
+    assert_eq!(cold.1, vec![good_anc]);
+
+    // --- M6: `DigestCache` overwrite round-trip (Astra's `cache_contract.rs`!) ---
+    let sb = TempSandbox::new();
+    let cdir = sb.root.join("m6-cache");
+    fs::create_dir_all(&cdir).unwrap();
+    let k = [0x01u8; 20];
+    let d1 = [0x01u8; 32];
+    let d2 = [0x02u8; 32];
+    {
+        let mut c = git_buttress::cache::DigestCache::load_from_git_dir(&cdir);
+        c.put_blob(k, d1);
+        c.put_blob(k, d2);
+        c.put_tree(k, d1);
+        c.put_tree(k, d2);
+        c.put_commit(k, d1);
+        c.put_commit(k, d2);
+        c.flush();
+    }
+    {
+        let c = git_buttress::cache::DigestCache::load_from_git_dir(&cdir);
+        assert_eq!(c.get_blob(&k), Some(d2));
+        assert_eq!(c.get_tree(&k), Some(d2));
+        assert_eq!(c.get_commit(&k), Some(d2));
+    }
+
+    // --- H10: Install -> repeat install -> disable preserves & restores prior `core.hooksPath`
+    //          AND chains `.git/hooks/pre-commit`! (Astra's `install_lifecycle.py`!) ---
+    let prior_hooks = sb.root.join("prior-hooks");
+    fs::create_dir_all(&prior_hooks).unwrap();
+    assert!(
+        Command::new(&sb.real_git)
+            .env("HOME", &sb.home)
+            .args(["config", "--global", "core.hooksPath", prior_hooks.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(sb.run_buttress(&sb.root, &["enable", "--global", "--no-wrapper"]).status.success());
+    // Repeat install MUST NOT clobber saved `prior-hooks`!
+    assert!(sb.run_buttress(&sb.root, &["enable", "--global", "--no-wrapper"]).status.success());
+    let hooks_path = sb.home.join(".config/git-buttress/hooks");
+    let pc_script = fs::read_to_string(hooks_path.join("post-commit")).unwrap();
+    assert!(
+        pc_script.contains(prior_hooks.to_str().unwrap()),
+        "H10: repeat enable must preserve prior core.hooksPath in chained dispatcher!"
+    );
+    // Disable MUST restore `prior-hooks` and clean up generated scripts!
+    assert!(sb.run_buttress(&sb.root, &["disable", "--global"]).status.success());
+    let restored = String::from_utf8_lossy(
+        &Command::new(&sb.real_git)
+            .env("HOME", &sb.home)
+            .args(["config", "--global", "--get", "--path", "core.hooksPath"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        fs::canonicalize(&restored).unwrap(),
+        fs::canonicalize(&prior_hooks).unwrap(),
+        "H10: disable must restore prior core.hooksPath!"
+    );
+    assert!(!hooks_path.join("post-commit").exists());
+
+    // --- H8: Preview `git commit --null` / `--dry-run` MUST NOT seal previous HEAD, and local
+    //         `.git/hooks/pre-commit` MUST still run when global `git-buttress` is enabled! ---
+    let _ = Command::new(&sb.real_git)
+        .env("HOME", &sb.home)
+        .args(["config", "--global", "--unset", "core.hooksPath"])
+        .output();
+    assert!(sb.run_buttress(&sb.root, &["enable", "--global"]).status.success());
+
+    let h8_repo = sb.root.join("h8-repo");
+    fs::create_dir_all(&h8_repo).unwrap();
+    assert!(sb.run_stock_git(&h8_repo, &["init", "-b", "main"]).status.success());
+    fs::write(h8_repo.join("a.txt"), "plain\n").unwrap();
+    assert!(sb.run_stock_git(&h8_repo, &["add", "a.txt"]).status.success());
+    assert!(sb.run_stock_git(&h8_repo, &["commit", "-m", "unsealed base"]).status.success());
+    let unsealed_head = String::from_utf8_lossy(
+        &sb.run_stock_git(&h8_repo, &["rev-parse", "HEAD"]).stdout,
+    )
+    .trim()
+    .to_string();
+
+    // Run `git commit --dry-run --null` with staged changes: MUST NOT touch `unsealed_head`!
+    fs::write(h8_repo.join("a.txt"), "staged\n").unwrap();
+    assert!(sb.run_user_git(&h8_repo, &["add", "a.txt"]).status.success());
+    let _ = sb.run_user_git(&h8_repo, &["commit", "--dry-run", "--null"]);
+    let head_after_preview = String::from_utf8_lossy(
+        &sb.run_stock_git(&h8_repo, &["rev-parse", "HEAD"]).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        unsealed_head, head_after_preview,
+        "H8: preview git commit must never seal or rewrite previous HEAD!"
+    );
+
+    // Install a repo-local `.git/hooks/pre-commit` that writes a marker file — verify global hooks forward to it!
+    let local_pre = h8_repo.join(".git/hooks/pre-commit");
+    fs::write(
+        &local_pre,
+        format!(
+            "#!/bin/sh\ntouch '{}'\n",
+            h8_repo.join("pre-commit-ran").display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&local_pre).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&local_pre, perms).unwrap();
+    }
+    assert!(sb.run_user_git(&h8_repo, &["commit", "-m", "real commit"]).status.success());
+    assert!(
+        h8_repo.join("pre-commit-ran").exists(),
+        "H10: global git-buttress hooks must still forward to repo-local .git/hooks/pre-commit!"
+    );
+
+    // --- M3: Ref traversal syntax `v1+blake3-<hex>~1` MUST be rejected rather than applying pin to parent! ---
+    let pin_walk = format!("v1+blake3-{good_hex}~1");
+    assert!(
+        git_buttress::protocol::parse_ref_embedded_b3(&pin_walk).is_err(),
+        "M3: ~1 on a +blake3- ref must fail closed as ambiguous!"
     );
 }

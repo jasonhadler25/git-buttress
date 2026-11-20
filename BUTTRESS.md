@@ -185,8 +185,13 @@ BLAKE3 output.
 * **Across kinds.** The context strings differ, so a digest of one kind
   never equals a digest of another.
 
-So a digest of a commit fixes every byte of every file, every name and mode,
-every commit message, and the whole shape of the history behind it.
+So once every reachable comparison in section 5 succeeds, a verified commit
+digest computationally binds every byte of every file, every name and mode,
+every commit message, and the whole shape of the history behind it (assuming
+BLAKE3 collision and second-preimage resistance). Note that `id` alone on a
+commit carrying lines hashes that commit's raw claims without walking its
+descendants; full verification (`check` / `fsck`) is what binds those claims to
+the stored objects.
 
 ## 8. What it does not do
 
