@@ -241,12 +241,15 @@ detection, the kind of SHA-1 Git uses.
 
 ## 10. Tag Naming & Configuration Conventions
 
-* **Self-verifying tag names (`+blake3-<64-hex>`):** When `git-buttress` is
-  enabled (and `buttress.autotag` is not `false`), creating a tag `refs/tags/X`
-  also creates `refs/tags/X+blake3-<digest>`, where `<digest>` is the 64-hex
+* **Opt-in self-verifying tag names (`+blake3-<64-hex>`):** By default
+  (`buttress.autotag = false`), `git tag` leaves tag names untouched so day-one
+  adoption is completely invisible. When a maintainer opts in via
+  `git config buttress.autotag true`, creating or force-updating `refs/tags/X`
+  also updates `refs/tags/X+blake3-<digest>`, where `<digest>` is the 64-hex
   digest of the tagged object (for an annotated tag, the target commit/tree/blob
   it points to). Any reader checking or fetching a ref containing
-  `+blake3-<64-hex>` treats `<64-hex>` as the expected digest of the target.
+  `+blake3-<64-hex>` treats `<64-hex>` as the expected digest of the target
+  (whether or not `buttress.autotag` is set on the reader).
 * **Annotated tag trailer:** Annotated tags MAY also carry
   `Buttress-Object: blake3 <target-sha1> <64-hex>` in the tag body prior to any
   signature block.

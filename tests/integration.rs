@@ -210,8 +210,28 @@ fn maya_dana_sam_readme_story_end_to_end() {
         "wrapped `git fsck` should also run buttress fsck"
     );
 
-    // 3. Maya runs plain `git tag v2.4.0` -> companion `v2.4.0+blake3-<64hex>` tag is minted!
-    let tag_out = sb.run_user_git(&maya_repo, &["tag", "v2.4.0"]);
+    // 3a. By default (`buttress.autotag` unset / false), `git tag v2.4.0` is 100% invisible:
+    //     ONLY `v2.4.0` is created (zero extra `+blake3-` tags!).
+    let tag_default = sb.run_user_git(&maya_repo, &["tag", "v2.4.0"]);
+    assert!(tag_default.status.success());
+    let default_tags = String::from_utf8_lossy(&sb.run_user_git(&maya_repo, &["tag", "-l"]).stdout)
+        .lines()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        default_tags,
+        vec!["v2.4.0".to_string()],
+        "default tagging must stay 100% invisible unless buttress.autotag=true!"
+    );
+
+    // 3b. Opting into Layer 2 (`buttress.autotag = true`) and running `git tag -f v2.4.0`
+    //     mints the companion `v2.4.0+blake3-<64hex>` tag!
+    assert!(
+        sb.run_user_git(&maya_repo, &["config", "buttress.autotag", "true"])
+            .status
+            .success()
+    );
+    let tag_out = sb.run_user_git(&maya_repo, &["tag", "-f", "v2.4.0"]);
     assert!(tag_out.status.success());
     let tags = String::from_utf8_lossy(&sb.run_user_git(&maya_repo, &["tag", "-l"]).stdout)
         .lines()
@@ -221,7 +241,7 @@ fn maya_dana_sam_readme_story_end_to_end() {
     let b3_tag = tags
         .iter()
         .find(|t| t.starts_with("v2.4.0+blake3-"))
-        .expect("companion +blake3- tag must be created")
+        .expect("companion +blake3- tag must be created when buttress.autotag=true")
         .clone();
 
     // `git describe --tags` still returns clean `v2.4.0`!
@@ -804,7 +824,17 @@ fn contract_obligations_found_during_dbc_pass() {
         "shell metacharacters in HOME must never execute!"
     );
 
-    // Test `git tag v1` then `git tag -f v1` on a new commit mints updated companion tag!
+    // Test `git tag v1` then `git tag -f v1` (with `buttress.autotag=true`) mints updated companion tag!
+    assert!(
+        Command::new(&h_git)
+            .current_dir(&repo_dir)
+            .env("HOME", &hostile_home)
+            .env("PATH", &h_path)
+            .args(["config", "buttress.autotag", "true"])
+            .status()
+            .unwrap()
+            .success()
+    );
     assert!(
         Command::new(&h_git)
             .current_dir(&repo_dir)

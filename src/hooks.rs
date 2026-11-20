@@ -16,9 +16,11 @@
 //!    any ref containing `"+blake3-"` is verified with `DigestCache::memory_only()` before
 //!    Git commits the ref transaction. Any `Mismatch` returns `Err` (exit 1), causing Git
 //!    to abort the ref transaction cleanly.
-//! 4. **Tag companion minting (`committed` phase):** Companion `refs/tags/<name>+blake3-<dig>`
-//!    is minted on both tag creation (`old == 0`) and forced tag update (`git tag -f`),
-//!    peeling annotated tag chains with cycle detection, and never firing on remote fetches.
+//! 4. **Opt-in tag companion minting (`committed` phase):** When `buttress.autotag` is
+//!    opted into (`true`; default is `false` so day-one adoption is 100% invisible on
+//!    GitHub), companion `refs/tags/<name>+blake3-<dig>` is minted on both tag creation
+//!    and forced tag update (`git tag -f`), peeling annotated tag chains with cycle
+//!    detection, and never firing on remote fetches.
 
 use crate::cache::{Dig, DigestCache, Oid};
 use crate::git::{GitRepo, ObjKind, ObjectStore, WRAPPER_MARKER, hex_to_oid, resolve_real_git, to_hex};
@@ -448,9 +450,10 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
     }
 
     // phase == "committed":
-    // When the user creates a plain tag `refs/tags/<name>` locally (not during fetch/clone!),
-    // automatically mint the companion tag `refs/tags/<name>+blake3-<64-hex>`!
-    let auto_tag = repo.config_bool("buttress.autotag", true);
+    // When the user explicitly opted into `buttress.autotag = true` (default: `false`, keeping
+    // plain `git tag` 100% invisible unless requested) and creates/updates a local tag
+    // `refs/tags/<name>`, automatically mint `refs/tags/<name>+blake3-<64-hex>`.
+    let auto_tag = repo.config_bool("buttress.autotag", false);
     if !auto_tag {
         return Ok(());
     }

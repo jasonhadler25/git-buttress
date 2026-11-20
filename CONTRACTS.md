@@ -334,10 +334,11 @@ contract run_reference_transaction_hook(phase: &str) -> Result<(), String>
       * `Incomplete` ==> Err if ref has `"+blake3-"` or `buttress.missing == error`, else stderr note.
       * `NoEvidence` ==> respects `buttress.missing` (`silent` / `warn` / `error`), suppressing warnings on
         a plain tag when a companion `+blake3-` tag for the same OID is in the same transaction.
-    - When `phase == "committed"`: if `buttress.autotag` (default true) and transaction is local (no
-      `refs/remotes/*` updates and `GIT_REFLOG_ACTION` not `clone`/`fetch`/`pull`), for each created/updated
-      plain tag `refs/tags/<T>` without `"+blake3-"`, peels to target object, computes its BLAKE3 digest `D`,
-      and updates `refs/tags/<T>+blake3-<hex(D)>` to `<new-oid>` with `GIT_BUTTRESS_INTERNAL=1`.
+    - When `phase == "committed"`: if `buttress.autotag` is explicitly `true` (default `false`) and
+      transaction is local (no `refs/remotes/*` updates and `GIT_REFLOG_ACTION` not `clone`/`fetch`/`pull`),
+      for each created/updated plain tag `refs/tags/<T>` without `"+blake3-"`, peels to target object,
+      computes its BLAKE3 digest `D`, and updates `refs/tags/<T>+blake3-<hex(D)>` to `<new-oid>` with
+      `GIT_BUTTRESS_INTERNAL=1`.
   writes repo refs & `.git/buttress-cache.bin` (only in `committed` phase), stderr
 ```
 
