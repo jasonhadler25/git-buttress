@@ -160,6 +160,20 @@ fn spec_empty_vectors_and_domain_separation() {
         to_hex(&keys.hash_dir(b"")),
         "acf91ceb6e37c08b51530bf4cc86ae17daaf716f9f2284a1e0ce94c7001a68cd"
     );
+    // Exact pinned vector from `BUTTRESS.md` §6 (539-byte sealed example commit):
+    let spec_example_sealed = concat!(
+        "tree 90c9a260ae4584953a6c62f075868e69c9fa5fbb\n",
+        "parent 3e7178d62f0450add99fb24c9a9df67c90fd9352\n",
+        "author jasonhadler25 <jasonhadler25@users.noreply.github.com> 1795062191 -0800\n",
+        "committer jasonhadler25 <jasonhadler25@users.noreply.github.com> 1795062191 -0800\n",
+        "buttress-tree blake3 90c9a260ae4584953a6c62f075868e69c9fa5fbb a75286bbdeff34599303a1850e756ec9e23b303ff5fe13b6fc10472f8467687f\n",
+        "buttress-parent blake3 47d94ceee1cbe424964472bd63f308eab32b258a60298c6689a04f5d390b7d7a\n\n",
+        "Add SMUGGLING.md essay and MiniSHAKE128 (eprint 2026/2363) examples\n"
+    );
+    assert_eq!(
+        to_hex(&keys.hash_sealed_commit(spec_example_sealed.as_bytes())),
+        "54538914c22fce7eb013e773fe5914d5d1fca0bb3058933aff2f3f57d82ec855"
+    );
     // Domain separation: identical input bytes yield completely unrelated digests across all 4 contexts
     let d_f = keys.hash_file(b"same");
     let d_d = keys.hash_dir(b"same");
@@ -890,5 +904,324 @@ fn contract_obligations_found_during_dbc_pass() {
     assert!(
         tags_after.contains(&format!("v1+blake3-{head_b3}")),
         "git tag -f must mint companion tag for new commit: {tags_after}"
+    );
+}
+
+#[test]
+fn mutation_survivor_killing_suite() {
+    let keys = ContextKeys::new();
+
+    // --- 1. Annotated tag parser (`parse_annotated_tag`) & tag peeling ---
+    let target_oid = [0x12u8; 20];
+    let target_hex = to_hex(&target_oid);
+    let good_dig = keys.hash_file(b"tag-payload");
+    let good_hex = to_hex(&good_dig);
+    let other_hex = to_hex(&keys.hash_file(b"other"));
+
+    // Valid `Buttress-Object: blake3` + ignored unknown algorithm `Buttress-Object: sha256 ...`
+    let valid_tag = format!(
+        "object {target_hex}\ntype blob\ntag v1\ntagger T <t@e> 1 +0000\n\nMsg\n\n\
+         Buttress-Object: sha256 {target_hex} 0000\n\
+         Buttress-Object: blake3 {target_hex} {good_hex}\n\
+         -----BEGIN SSH SIGNATURE-----\nButtress-Object: blake3 {target_hex} {other_hex}\n-----END SSH SIGNATURE-----\n"
+    );
+    let (p_oid, p_kind, p_dig) =
+        git_buttress::protocol::parse_annotated_tag(valid_tag.as_bytes()).unwrap();
+    assert_eq!(p_oid, target_oid);
+    assert_eq!(p_kind, ObjKind::Blob);
+    assert_eq!(p_dig, Some(good_dig));
+
+    // Malformed algorithm token in tag trailer (`UPPER`, `-bad`, empty)
+    for bad_alg in ["", "BLAKE3", "-blake3", "blake3_bad"] {
+        let bad_tag = format!(
+            "object {target_hex}\ntype blob\ntag v1\n\nButtress-Object: {bad_alg} {target_hex} {good_hex}\n"
+        );
+        assert!(
+            git_buttress::protocol::parse_annotated_tag(bad_tag.as_bytes()).is_err(),
+            "expected bad alg {bad_alg:?} in tag trailer to fail"
+        );
+    }
+
+    // Wrong field count in blake3 tag trailer (2 fields or 4 fields)
+    for bad_fields in [
+        format!("{target_hex}"),
+        format!("{target_hex} {good_hex} extra"),
+    ] {
+        let bad_tag =
+            format!("object {target_hex}\ntype blob\ntag v1\n\nButtress-Object: blake3 {bad_fields}\n");
+        assert!(git_buttress::protocol::parse_annotated_tag(bad_tag.as_bytes()).is_err());
+    }
+
+    // Tag trailer OID != header `object`
+    let wrong_oid_hex = to_hex(&[0x99u8; 20]);
+    let mismatch_oid_tag = format!(
+        "object {target_hex}\ntype blob\ntag v1\n\nButtress-Object: blake3 {wrong_oid_hex} {good_hex}\n"
+    );
+    assert!(git_buttress::protocol::parse_annotated_tag(mismatch_oid_tag.as_bytes()).is_err());
+
+    // Duplicate `Buttress-Object: blake3` trailers MUST fail (whereas 1 succeeds!)
+    let dup_tag = format!(
+        "object {target_hex}\ntype blob\ntag v1\n\n\
+         Buttress-Object: blake3 {target_hex} {good_hex}\n\
+         Buttress-Object: blake3 {target_hex} {good_hex}\n"
+    );
+    assert!(git_buttress::protocol::parse_annotated_tag(dup_tag.as_bytes()).is_err());
+
+    // --- 2. Direct Blob, Tree, and Annotated-Tag `verify_target` tests ---
+    struct MemStore {
+        objs: HashMap<Oid, (ObjKind, Vec<u8>)>,
+        shallow: HashSet<Oid>,
+    }
+    impl ObjectStore for MemStore {
+        fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, String> {
+            Ok(self.objs.get(oid).cloned())
+        }
+        fn shallow_commits(&self) -> &HashSet<Oid> {
+            &self.shallow
+        }
+    }
+
+    let mut store = MemStore {
+        objs: HashMap::new(),
+        shallow: HashSet::new(),
+    };
+    store
+        .objs
+        .insert(target_oid, (ObjKind::Blob, b"tag-payload".to_vec()));
+
+    // Blob verification: Match, Mismatch, and NoEvidence
+    assert!(matches!(
+        verify_target(&mut store, &keys, target_oid, None, Some(good_dig), true).unwrap(),
+        CheckOutcome::Match { .. }
+    ));
+    assert_eq!(
+        verify_target(
+            &mut store,
+            &keys,
+            target_oid,
+            None,
+            Some([0x55; 32]),
+            true
+        )
+        .unwrap_err()
+        .kind,
+        VerifyErrorKind::Mismatch
+    );
+    assert!(matches!(
+        verify_target(&mut store, &keys, target_oid, None, None, true).unwrap(),
+        CheckOutcome::NoEvidence { .. }
+    ));
+
+    // Tree verification: Match, Mismatch, and NoEvidence (with 7-digit valid octal mode `0100644`)
+    let tree_oid = [0x34u8; 20];
+    let mut tree_raw = b"0100644 file.bin\0".to_vec();
+    tree_raw.extend_from_slice(&target_oid);
+    store
+        .objs
+        .insert(tree_oid, (ObjKind::Tree, tree_raw.clone()));
+    let mut expected_tree_buf = b"0100644 file.bin\0".to_vec();
+    expected_tree_buf.extend_from_slice(&good_dig);
+    let expected_tree_dig = keys.hash_dir(&expected_tree_buf);
+
+    assert!(matches!(
+        verify_target(
+            &mut store,
+            &keys,
+            tree_oid,
+            None,
+            Some(expected_tree_dig),
+            true
+        )
+        .unwrap(),
+        CheckOutcome::Match { .. }
+    ));
+    assert_eq!(
+        verify_target(&mut store, &keys, tree_oid, None, Some([0x77; 32]), true)
+            .unwrap_err()
+            .kind,
+        VerifyErrorKind::Mismatch
+    );
+    assert!(matches!(
+        verify_target(&mut store, &keys, tree_oid, None, None, true).unwrap(),
+        CheckOutcome::NoEvidence { .. }
+    ));
+
+    // Annotated tag verification: Match via trailer, Match when `--expect` AGREES with trailer,
+    // disagreement with `--expect`, disagreement with `+blake3-` ref, and valid 2-hop tag chain `outer -> tag_oid -> target_oid`!
+    let tag_oid = [0x56u8; 20];
+    store
+        .objs
+        .insert(tag_oid, (ObjKind::Tag, valid_tag.into_bytes()));
+    assert!(matches!(
+        verify_target(&mut store, &keys, tag_oid, None, None, true).unwrap(),
+        CheckOutcome::Match { .. }
+    ));
+    assert!(matches!(
+        verify_target(&mut store, &keys, tag_oid, None, Some(good_dig), true).unwrap(),
+        CheckOutcome::Match { .. }
+    ));
+    let outer_tag_oid = [0x57u8; 20];
+    let outer_tag_raw = format!(
+        "object {}\ntype tag\ntag outer\ntagger T <t@e> 1 +0000\n\nOuter tag\n",
+        to_hex(&tag_oid)
+    );
+    store
+        .objs
+        .insert(outer_tag_oid, (ObjKind::Tag, outer_tag_raw.into_bytes()));
+    assert!(matches!(
+        verify_target(&mut store, &keys, outer_tag_oid, None, None, true).unwrap(),
+        CheckOutcome::Match { .. }
+    ));
+    // `--expect` disagrees with tag trailer -> Mismatch!
+    assert_eq!(
+        verify_target(&mut store, &keys, tag_oid, None, Some([0x88; 32]), true)
+            .unwrap_err()
+            .kind,
+        VerifyErrorKind::Mismatch
+    );
+    // `--expect` disagrees with `+blake3-` ref_hint -> Mismatch!
+    let conflicting_ref = format!("refs/tags/v1+blake3-{other_hex}");
+    assert_eq!(
+        verify_target(
+            &mut store,
+            &keys,
+            target_oid,
+            Some(&conflicting_ref),
+            Some(good_dig),
+            true
+        )
+        .unwrap_err()
+        .kind,
+        VerifyErrorKind::Mismatch
+    );
+
+    // --- 3. `parse_commit` & `strip_blake3_and_sig_headers` edge cases ---
+    // Unknown algorithm (`sha256`, `sha3-256`) ignored; invalid algorithm (`UPPER`, `0start`, `bad_char`) rejected!
+    let tree_hex = to_hex(&tree_oid);
+    let plain_with_other_alg = format!(
+        "tree {tree_hex}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\
+         buttress-tree sha3-256 anything\n\
+         buttress-parent sha256 anything\n\
+         mergetag object {target_hex}\n continuation line kept!\n\
+         gpgsig -----BEGIN SSH SIGNATURE-----\n sig line stripped!\n\nBody\n"
+    );
+    let pc =
+        git_buttress::protocol::parse_commit([0xaa; 20], plain_with_other_alg.as_bytes().to_vec())
+            .unwrap();
+    assert_eq!(pc.class, git_buttress::protocol::CommitClass::Plain);
+    assert!(pc.has_gpgsig);
+
+    // Check `strip_blake3_and_sig_headers` keeps `mergetag`'s continuation line AND drops `gpgsig`'s continuation line!
+    let (hdr, _) = git_buttress::protocol::split_headers_body(plain_with_other_alg.as_bytes());
+    let kept = git_buttress::protocol::strip_blake3_and_sig_headers(hdr);
+    assert!(kept.iter().any(|l| l == b" continuation line kept!"));
+    assert!(!kept.iter().any(|l| l == b" sig line stripped!"));
+
+    // Invalid algorithm names on both `buttress-tree` and `buttress-parent` MUST be rejected
+    for bad_alg in ["", "BLAKE3", "3blake", "blake3_x"] {
+        let bad_c1 = format!("tree {tree_hex}\nbuttress-tree {bad_alg} x\n\nb\n");
+        assert!(git_buttress::protocol::parse_commit([0xbb; 20], bad_c1.into_bytes()).is_err());
+        let bad_c2 = format!("tree {tree_hex}\nbuttress-parent {bad_alg} x\n\nb\n");
+        assert!(git_buttress::protocol::parse_commit([0xcc; 20], bad_c2.into_bytes()).is_err());
+    }
+    // Empty `buttress-tree` and `buttress-parent` lines MUST be rejected
+    assert!(
+        git_buttress::protocol::parse_commit(
+            [0xdd; 20],
+            format!("tree {tree_hex}\nbuttress-tree\n\nb\n").into_bytes()
+        )
+        .is_err()
+    );
+    assert!(
+        git_buttress::protocol::parse_commit(
+            [0xee; 20],
+            format!("tree {tree_hex}\nbuttress-parent\n\nb\n").into_bytes()
+        )
+        .is_err()
+    );
+
+    // --- 4. `DigestCache`: `memory_only` leaves `pending` empty; `KIND_COMMIT` round-trips; bad magic ignored ---
+    let mut mem_c = git_buttress::cache::DigestCache::memory_only();
+    mem_c.put_blob([1; 20], [2; 32]);
+    mem_c.put_tree([3; 20], [4; 32]);
+    mem_c.put_commit([5; 20], [6; 32]);
+    mem_c.flush(); // no-op on memory_only
+
+    let sb = TempSandbox::new();
+    let cdir = sb.root.join("cache-mut");
+    fs::create_dir_all(&cdir).unwrap();
+    // Write bad 8-byte magic first -> load ignores it, flush overwrites cleanly!
+    fs::write(cdir.join("buttress-cache.bin"), b"BADMAGIC").unwrap();
+    {
+        let mut dc = git_buttress::cache::DigestCache::load_from_git_dir(&cdir);
+        assert!(dc.commits.is_empty());
+        dc.put_commit([9; 20], [8; 32]);
+        dc.flush();
+    }
+    {
+        let dc = git_buttress::cache::DigestCache::load_from_git_dir(&cdir);
+        assert_eq!(dc.commits.get(&[9; 20]), Some(&[8; 32]));
+    }
+    // Also test exact 8-byte valid magic (0 records):
+    let cdir2 = sb.root.join("cache-empty-hdr");
+    fs::create_dir_all(&cdir2).unwrap();
+    fs::write(cdir2.join("buttress-cache.bin"), b"BTRSC001").unwrap();
+    {
+        let mut dc = git_buttress::cache::DigestCache::load_from_git_dir(&cdir2);
+        dc.put_blob([7; 20], [6; 32]);
+        dc.flush();
+        let raw_len = fs::metadata(cdir2.join("buttress-cache.bin")).unwrap().len();
+        assert_eq!(raw_len, 8 + 53, "exact 8-byte magic header must append 1 record -> 61 bytes");
+    }
+
+    // --- 5. Real `.git/shallow` clone test & `resolve_real_git` wrapper-skipping test ---
+    let full_repo = sb.root.join("full-src");
+    fs::create_dir_all(&full_repo).unwrap();
+    assert!(sb.run_buttress(&full_repo, &["enable", "--global"]).status.success());
+    assert!(sb.run_user_git(&full_repo, &["init"]).status.success());
+    fs::write(full_repo.join("f.txt"), "1\n").unwrap();
+    assert!(sb.run_user_git(&full_repo, &["add", "f.txt"]).status.success());
+    assert!(sb.run_user_git(&full_repo, &["commit", "-m", "root"]).status.success());
+    fs::write(full_repo.join("f.txt"), "2\n").unwrap();
+    assert!(sb.run_user_git(&full_repo, &["commit", "-am", "tip"]).status.success());
+
+    let shallow_clone = sb.root.join("real-shallow");
+    let sh_out = sb.run_user_git(
+        &sb.root,
+        &[
+            "clone",
+            "--depth=1",
+            &format!("file://{}", full_repo.display()),
+            shallow_clone.to_str().unwrap(),
+        ],
+    );
+    assert!(sh_out.status.success(), "shallow clone failed: {:?}", sh_out);
+    assert!(
+        sb.run_buttress(&shallow_clone, &["check", "HEAD"])
+            .status
+            .success(),
+        "shallow clone check should pass by default"
+    );
+    assert!(
+        !sb.run_buttress(&shallow_clone, &["check", "HEAD", "--no-shallow"])
+            .status
+            .success(),
+        "shallow clone check MUST fail when --no-shallow is passed!"
+    );
+
+    // Test `resolve_real_git()` skips `GIT_BUTTRESS_REAL_GIT` if someone points it at our wrapper!
+    let wrapper_path = sb.bin.join("git");
+    assert!(git_buttress::git::is_our_wrapper(&wrapper_path));
+    assert!(!git_buttress::git::is_our_wrapper(&sb.real_git));
+    let id_with_bad_env = Command::new(&sb.buttress_bin)
+        .current_dir(&full_repo)
+        .env("GIT_BUTTRESS_REAL_GIT", &wrapper_path)
+        .env("PATH", sb.path_with_wrapper())
+        .args(["id", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(
+        id_with_bad_env.status.success(),
+        "resolve_real_git must skip wrapper even if GIT_BUTTRESS_REAL_GIT points to it!"
     );
 }

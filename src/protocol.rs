@@ -557,21 +557,21 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
                         to_hex(&cur)
                     )));
                 }
-                if !pc.parents.is_empty() && self.store.shallow_commits().contains(&cur) {
-                    // Only treat as incomplete if at least one parent is actually missing from the store
-                    for &p in &pc.parents {
-                        if self.store.read_object(&p).map_err(VerifyError::incomplete)?.is_none() {
-                            return Err(VerifyError::incomplete(format!(
-                                "shallow boundary at plain commit {} cuts across unsealed history (missing parent {})",
-                                to_hex(&cur),
-                                to_hex(&p)
-                            )));
-                        }
-                    }
-                }
                 stack.push((cur, true));
+                let cur_is_shallow = self.store.shallow_commits().contains(&cur);
                 for &p in pc.parents.iter().rev() {
                     if !self.cache.commits.contains_key(&p) {
+                        if self.store.read_object(&p).map_err(VerifyError::incomplete)?.is_none() {
+                            return Err(VerifyError::incomplete(if cur_is_shallow {
+                                format!(
+                                    "shallow boundary at plain commit {} cuts across unsealed history (missing parent {})",
+                                    to_hex(&cur),
+                                    to_hex(&p)
+                                )
+                            } else {
+                                format!("missing commit object {}", to_hex(&p))
+                            }));
+                        }
                         stack.push((p, false));
                     } else {
                         let ppc = self.load_commit(p)?;
