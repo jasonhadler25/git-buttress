@@ -870,6 +870,7 @@ pub enum CheckOutcome {
         target_oid: Oid,
         digest: Dig,
         ancestors_sealed_checked: usize,
+        shallow_stops: usize,
     },
 }
 
@@ -910,9 +911,10 @@ pub fn verify_target_with_engine<S: ObjectStore>(
     explicit_expect: Option<Dig>,
     allow_shallow: bool,
 ) -> Result<CheckOutcome, VerifyError> {
-    if engine.cache.get_blob(&[0; 20]).is_none() {
-        // Note: `engine` MUST be constructed with `DigestCache::memory_only()` by callers.
-    }
+    assert!(
+        engine.cache.is_memory_only(),
+        "TB-1 violation: verify_target_with_engine requires a memory-only DigestCache!"
+    );
     let ref_expect = match ref_hint {
         Some(r) => parse_ref_embedded_b3(r)?,
         None => None,
@@ -927,91 +929,91 @@ pub fn verify_target_with_engine<S: ObjectStore>(
         }
     }
     let mut expect = explicit_expect.or(ref_expect);
-    let pinned_expect = expect.is_some();
 
-    let (mut cur_kind, raw) = engine
+    // Check object type via `object_info` FIRST so direct blobs (or tagged blobs) NEVER allocate
+    // a multi-GB Vec in RAM and NEVER stream-hash twice (`R2-H7` & Astra `round2_contract` fix)!
+    let (mut cur_kind, _) = engine
         .store
-        .read_object(&start_oid)
+        .object_info(&start_oid)
         .map_err(VerifyError::from_store)?
         .ok_or_else(|| VerifyError::incomplete(format!("missing object {}", to_hex(&start_oid))))?;
     let mut target_oid = start_oid;
 
-    // Peel annotated tag(s) using canonical Git tag rules + cycle detection!
-    // For nested tags (`outer -> inner -> target`), a `Buttress-Object` trailer on an outer tag
-    // targeting `inner` (`type tag`) is disallowed unless it has no trailer; trailers bind leaf non-tag objects.
-    let mut raw_cur = raw;
-    let mut seen_tags: HashSet<Oid> = HashSet::new();
-    seen_tags.insert(start_oid);
-    while cur_kind == ObjKind::Tag {
-        let (next_oid, decl_kind, trailer_dig) = parse_annotated_tag(&raw_cur)?;
-        if decl_kind == ObjKind::Tag && trailer_dig.is_some() {
-            return Err(VerifyError::mismatch(
-                "Buttress-Object trailer on a tag-to-tag object is ambiguous; attach trailer to the tag naming the non-tag target",
-            ));
+    if cur_kind == ObjKind::Tag {
+        let (k_init, mut raw_cur) = engine
+            .store
+            .read_object(&start_oid)
+            .map_err(VerifyError::from_store)?
+            .ok_or_else(|| {
+                VerifyError::incomplete(format!("missing object {}", to_hex(&start_oid)))
+            })?;
+        if k_init != ObjKind::Tag {
+            return Err(VerifyError::store_failure("inconsistent object type for start tag"));
         }
-        if let (Some(exp), Some(td)) = (expect, trailer_dig) {
-            if !ct_eq(&exp, &td) {
-                return Err(VerifyError::mismatch(format!(
-                    "tag Buttress-Object ({}) disagrees with expected digest ({})",
-                    to_hex(&td),
-                    to_hex(&exp)
-                )));
+        let mut seen_tags: HashSet<Oid> = HashSet::new();
+        seen_tags.insert(start_oid);
+        while cur_kind == ObjKind::Tag {
+            let (next_oid, decl_kind, trailer_dig) = parse_annotated_tag(&raw_cur)?;
+            if decl_kind == ObjKind::Tag && trailer_dig.is_some() {
+                return Err(VerifyError::mismatch(
+                    "Buttress-Object trailer on a tag-to-tag object is ambiguous; attach trailer to the tag naming the non-tag target",
+                ));
             }
-        }
-        if expect.is_none() {
-            expect = trailer_dig;
-        }
-        target_oid = next_oid;
+            if let (Some(exp), Some(td)) = (expect, trailer_dig) {
+                if !ct_eq(&exp, &td) {
+                    return Err(VerifyError::mismatch(format!(
+                        "tag Buttress-Object ({}) disagrees with expected digest ({})",
+                        to_hex(&td),
+                        to_hex(&exp)
+                    )));
+                }
+            }
+            if expect.is_none() {
+                expect = trailer_dig;
+            }
+            target_oid = next_oid;
 
-        // If the target is a Blob, verify its kind via `hash_blob` streaming without loading multi-GB into RAM!
-        if decl_kind == ObjKind::Blob {
             let (actual_kind, _) = engine
                 .store
-                .hash_blob(&target_oid, engine.keys)
+                .object_info(&target_oid)
                 .map_err(VerifyError::from_store)?
                 .ok_or_else(|| {
-                    VerifyError::incomplete(format!("missing tagged blob {}", to_hex(&target_oid)))
+                    VerifyError::incomplete(format!("missing tagged object {}", to_hex(&target_oid)))
                 })?;
-            if actual_kind != ObjKind::Blob {
+            if actual_kind != decl_kind {
                 return Err(VerifyError::mismatch(format!(
-                    "tag declared target type blob, but object {} is {}",
+                    "tag declared target type {}, but object {} is {}",
+                    decl_kind.as_str(),
                     to_hex(&target_oid),
                     actual_kind.as_str()
                 )));
             }
-            cur_kind = ObjKind::Blob;
-            break;
-        }
-
-        let (actual_kind, r2) = engine
-            .store
-            .read_object(&target_oid)
-            .map_err(VerifyError::from_store)?
-            .ok_or_else(|| {
-                VerifyError::incomplete(format!("missing tagged object {}", to_hex(&target_oid)))
-            })?;
-        if actual_kind != decl_kind {
-            return Err(VerifyError::mismatch(format!(
-                "tag declared target type {}, but object {} is {}",
-                decl_kind.as_str(),
-                to_hex(&target_oid),
-                actual_kind.as_str()
-            )));
-        }
-        cur_kind = actual_kind;
-        if cur_kind == ObjKind::Tag {
-            if !seen_tags.insert(target_oid) {
-                return Err(VerifyError::mismatch(format!(
-                    "cycle in annotated tag chain at {}",
-                    to_hex(&target_oid)
-                )));
+            cur_kind = actual_kind;
+            if cur_kind == ObjKind::Tag {
+                if !seen_tags.insert(target_oid) {
+                    return Err(VerifyError::mismatch(format!(
+                        "cycle in annotated tag chain at {}",
+                        to_hex(&target_oid)
+                    )));
+                }
+                let (_, r2) = engine
+                    .store
+                    .read_object(&target_oid)
+                    .map_err(VerifyError::from_store)?
+                    .ok_or_else(|| {
+                        VerifyError::incomplete(format!(
+                            "missing tagged object {}",
+                            to_hex(&target_oid)
+                        ))
+                    })?;
+                raw_cur = r2;
             }
-            raw_cur = r2;
         }
     }
 
-    // If a tag trailer supplied `expect`, treat it as an explicit pin on the target too!
-    let effective_allow_shallow = allow_shallow && !pinned_expect;
+    // `R2-H2` fix: Compute `pinned_expect` AFTER peeling tags so trailer-only pins ALSO enforce
+    // full non-shallow coverage!
+    let effective_allow_shallow = allow_shallow && expect.is_none();
 
     match cur_kind {
         ObjKind::Blob => {
@@ -1034,6 +1036,7 @@ pub fn verify_target_with_engine<S: ObjectStore>(
                     target_oid,
                     digest: actual,
                     ancestors_sealed_checked: 0,
+                    shallow_stops: 0,
                 }),
             }
         }
@@ -1057,6 +1060,7 @@ pub fn verify_target_with_engine<S: ObjectStore>(
                     target_oid,
                     digest: actual,
                     ancestors_sealed_checked: 0,
+                    shallow_stops: 0,
                 }),
             }
         }
@@ -1168,14 +1172,27 @@ pub fn verify_target_with_engine<S: ObjectStore>(
                     target_oid,
                     digest: root_dig,
                     ancestors_sealed_checked: seen_sealed.len(),
+                    shallow_stops,
                 });
             }
 
-            let plain_covered = engine
-                .parsed
-                .values()
-                .filter(|pc| !matches!(pc.class, CommitClass::Sealed { .. }))
-                .count();
+            // Count ONLY plain/stale commits reachable from `target_oid` (never polluted by earlier refs on shared Engine! `R2-Low` fix)
+            let mut plain_covered = 0usize;
+            let mut p_queue: VecDeque<Oid> = VecDeque::from([target_oid]);
+            let mut p_seen: HashSet<Oid> = HashSet::from([target_oid]);
+            while let Some(c) = p_queue.pop_front() {
+                let Some(pc) = engine.parsed.get(&c) else {
+                    continue;
+                };
+                if !matches!(pc.class, CommitClass::Sealed { .. }) {
+                    plain_covered += 1;
+                }
+                for &p in &pc.parents {
+                    if engine.parsed.contains_key(&p) && p_seen.insert(p) {
+                        p_queue.push_back(p);
+                    }
+                }
+            }
 
             Ok(CheckOutcome::Match {
                 target_oid,

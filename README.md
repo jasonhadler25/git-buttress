@@ -231,10 +231,12 @@ cargo test --release
 * [`CONTRACTS.md`](CONTRACTS.md) — Design-by-Contract (Hoare/Meyer/Ode-style)
   specifications, representation invariants, and trust boundaries for every
   module, stateful type, hook, wrapper, and CLI subcommand.
+* [`audits/`](audits/) — Independent GPT-6.2 Astra Pro security & contract audit
+  reports (unedited Round 1 & Round 2 reports).
 * [`tests/integration.rs`](tests/integration.rs) — End-to-end tests of the
   invisible commit/clone workflow, opt-in `+blake3-` tags, SSH signing,
-  `rebase`/`amend`, shallow boundaries, contract edge cases, and simulated
-  SHA1DC collision/second-preimage attacks.
+  `rebase`/`amend`, shallow boundaries, contract edge cases, audit regressions,
+  and simulated SHA1DC collision/second-preimage attacks.
 * [`BUTTRESS.md`](BUTTRESS.md) — Specification of `git-buttress` (wire headers,
   BLAKE3 context-string derivations, verification rules, safety argument, test
   vectors, and full Linux-kernel benchmark numbers: **1 min 18 s** for all 1.5M

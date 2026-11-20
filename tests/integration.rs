@@ -1502,3 +1502,164 @@ fn astra_audit_round1_regressions() {
         "M3: ~1 on a +blake3- ref must fail closed as ambiguous!"
     );
 }
+
+#[test]
+fn astra_audit_round2_regressions() {
+    use git_buttress::cache::Dig;
+    use std::ffi::OsString;
+
+    let keys = ContextKeys::new();
+
+    // --- 1. Astra `round2_contract.rs` #1: `GitRepo::open_with_global_args` with `-C subrepo` ---
+    let sb = TempSandbox::new();
+    let subrepo = sb.root.join("fixture");
+    fs::create_dir_all(&subrepo).unwrap();
+    assert!(sb.run_stock_git(&subrepo, &["init", "-b", "main"]).status.success());
+    let opened = GitRepo::open_with_global_args(
+        Some(&sb.root),
+        &[OsString::from("-C"), OsString::from("fixture")],
+    )
+    .unwrap();
+    let expected_git_dir = fs::canonicalize(subrepo.join(".git")).unwrap();
+    assert_eq!(
+        opened.git_dir(),
+        expected_git_dir,
+        "R2-H6: GitRepo::open_with_global_args(-C fixture) must resolve fixture/.git!"
+    );
+    assert_eq!(opened.common_dir(), expected_git_dir);
+
+    // --- 2. Astra `round2_contract.rs` #2: Direct blob `verify_target` MUST NOT call `read_object`! ---
+    struct CountingBlobStore {
+        reads: usize,
+        infos: usize,
+        hashes: usize,
+        shallow: HashSet<Oid>,
+    }
+    impl ObjectStore for CountingBlobStore {
+        fn has_object(&mut self, _: &Oid) -> Result<bool, StoreError> {
+            Ok(true)
+        }
+        fn object_info(&mut self, _: &Oid) -> Result<Option<(ObjKind, u64)>, StoreError> {
+            self.infos += 1;
+            Ok(Some((ObjKind::Blob, 13)))
+        }
+        fn read_object(&mut self, _: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, StoreError> {
+            self.reads += 1;
+            Ok(Some((ObjKind::Blob, b"ordinary data".to_vec())))
+        }
+        fn hash_blob(
+            &mut self,
+            _: &Oid,
+            keys: &ContextKeys,
+        ) -> Result<Option<(ObjKind, Dig)>, StoreError> {
+            self.hashes += 1;
+            Ok(Some((ObjKind::Blob, keys.hash_file(b"ordinary data"))))
+        }
+        fn shallow_commits(&self) -> &HashSet<Oid> {
+            &self.shallow
+        }
+    }
+    let mut counter = CountingBlobStore {
+        reads: 0,
+        infos: 0,
+        hashes: 0,
+        shallow: HashSet::new(),
+    };
+    verify_target(
+        &mut counter,
+        &keys,
+        [7; 20],
+        None,
+        Some(keys.hash_file(b"ordinary data")),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        (counter.reads, counter.hashes),
+        (0, 1),
+        "R2-H7: direct blob verify_target must stream-hash once with ZERO full read_object calls!"
+    );
+
+    // --- 3. R2-H3: `git commit` MUST succeed even when `buttress.missing = error` is active! ---
+    assert!(sb.run_buttress(&subrepo, &["enable", "--global"]).status.success());
+    assert!(
+        sb.run_user_git(&subrepo, &["config", "buttress.missing", "error"])
+            .status
+            .success()
+    );
+    fs::write(subrepo.join("hello.txt"), "strict mode commit\n").unwrap();
+    assert!(sb.run_user_git(&subrepo, &["add", "hello.txt"]).status.success());
+    let strict_commit = sb.run_user_git(&subrepo, &["commit", "-m", "Commit under missing=error"]);
+    assert!(
+        strict_commit.status.success(),
+        "R2-H3: local `git commit` must succeed and seal under `buttress.missing=error`: {:?}",
+        strict_commit
+    );
+    assert!(
+        sb.run_buttress(&subrepo, &["check", "HEAD", "--missing", "error"])
+            .status
+            .success()
+    );
+
+    // --- 4. R2-H5: `push-to-checkout` and `proc-receive` stubs MUST NOT be installed! ---
+    let hooks_dir = sb.home.join(".config/git-buttress/hooks");
+    assert!(
+        !hooks_dir.join("push-to-checkout").exists(),
+        "R2-H5: push-to-checkout stub must not exist (breaks receive.denyCurrentBranch=updateInstead)!"
+    );
+    assert!(
+        !hooks_dir.join("proc-receive").exists(),
+        "R2-H5: proc-receive stub must not exist!"
+    );
+
+    // --- 5. R2-H2: Trailer-only pin (`Buttress-Object:`) MUST reject shallow truncation even with `allow_shallow=true`! ---
+    struct ShallowTrailerStore {
+        objs: HashMap<Oid, (ObjKind, Vec<u8>)>,
+        shallow: HashSet<Oid>,
+    }
+    impl ObjectStore for ShallowTrailerStore {
+        fn has_object(&mut self, k: &Oid) -> Result<bool, StoreError> {
+            Ok(self.objs.contains_key(k))
+        }
+        fn read_object(&mut self, k: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, StoreError> {
+            Ok(self.objs.get(k).cloned())
+        }
+        fn shallow_commits(&self) -> &HashSet<Oid> {
+            &self.shallow
+        }
+    }
+    let tr_oid = [0x31u8; 20];
+    let missing_parent = [0x32u8; 20];
+    let tip_c = [0x33u8; 20];
+    let tag_o = [0x34u8; 20];
+    let tip_raw = format!(
+        "tree {}\nparent {}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\
+         buttress-tree blake3 {} {}\nbuttress-parent blake3 {}\n\ntip\n",
+        to_hex(&tr_oid),
+        to_hex(&missing_parent),
+        to_hex(&tr_oid),
+        to_hex(&keys.hash_dir(&[])),
+        to_hex(&[0xaa; 32])
+    );
+    let tip_dig = keys.hash_sealed_commit(tip_raw.as_bytes());
+    let tag_raw = format!(
+        "object {}\ntype commit\ntag v1\ntagger A <a@b> 1 +0000\n\nrel\n\nButtress-Object: blake3 {} {}\n",
+        to_hex(&tip_c),
+        to_hex(&tip_c),
+        to_hex(&tip_dig)
+    );
+    let mut st_store = ShallowTrailerStore {
+        objs: HashMap::from([
+            (tr_oid, (ObjKind::Tree, Vec::new())),
+            (tip_c, (ObjKind::Commit, tip_raw.into_bytes())),
+            (tag_o, (ObjKind::Tag, tag_raw.into_bytes())),
+        ]),
+        shallow: HashSet::from([tip_c]),
+    };
+    let tr_err = verify_target(&mut st_store, &keys, tag_o, None, None, true).unwrap_err();
+    assert_eq!(
+        tr_err.kind,
+        VerifyErrorKind::Incomplete,
+        "R2-H2: trailer-pinned tag must fail closed on missing shallow parent!"
+    );
+}

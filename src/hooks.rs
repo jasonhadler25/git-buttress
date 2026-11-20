@@ -620,19 +620,43 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
                 continue;
             }
 
+            // Note: DO NOT enforce `buttress.missing=error` on local `refs/heads/*` in `prepared`
+            // because stock `git commit` updates `HEAD`/branch FIRST and then invokes `post-commit`
+            // (`seal_head`)! Still enforce Mismatch on `refs/heads/*`, and enforce `missing=error`
+            // on `refs/remotes/*`, `refs/tags/*`, and `+blake3-` refs (`R2-H3` fix)!
+            let is_local_branch_update = ref_b.starts_with(b"refs/heads/") && !has_b3_name;
+
             let ref_display = String::from_utf8_lossy(ref_b);
             match verify_target_with_engine(&mut engine, oid, ref_utf8, None, true) {
                 Ok(CheckOutcome::Match { shallow_stops, .. }) => {
-                    if shallow_stops > 0 && policy == MissingPolicy::Error {
-                        return Err(format!(
-                            "buttress: {ref_display} stopped at {shallow_stops} shallow boundary parent(s) (buttress.missing=error)"
-                        ));
+                    if shallow_stops > 0 {
+                        match policy {
+                            MissingPolicy::Error if !is_local_branch_update => {
+                                return Err(format!(
+                                    "buttress: {} stopped at {shallow_stops} shallow boundary parent(s) (buttress.missing=error)",
+                                    sanitize_for_tty(&ref_display)
+                                ));
+                            }
+                            MissingPolicy::Warn => {
+                                eprintln!(
+                                    "buttress: warning: {} verified partially ({shallow_stops} shallow boundary parent(s) skipped)",
+                                    sanitize_for_tty(&ref_display)
+                                );
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                Ok(CheckOutcome::NoEvidence { .. }) => {
+                Ok(CheckOutcome::NoEvidence { shallow_stops, .. }) => {
+                    if shallow_stops > 0 && policy == MissingPolicy::Warn {
+                        eprintln!(
+                            "buttress: warning: {} had {shallow_stops} shallow boundary parent(s) skipped",
+                            sanitize_for_tty(&ref_display)
+                        );
+                    }
                     let is_paired_plain_tag =
                         paired_plain_tags.contains(&(ref_b.clone(), new_b.clone()));
-                    if !is_paired_plain_tag {
+                    if !is_paired_plain_tag && !is_local_branch_update {
                         match policy {
                             MissingPolicy::Silent => {}
                             MissingPolicy::Warn => {
@@ -727,15 +751,17 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
             continue;
         };
 
-        // Compute & validate target digest using a fresh memory-only Engine (NEVER disk cache! `H7`/`H9` fix)
+        // Compute & validate FULL non-shallow target digest (`allow_shallow=false`) using a fresh
+        // memory-only Engine so we NEVER mint a `+blake3-` pin for an incomplete shallow history (`R2-H2` fix)!
         let target_dig = {
             let mut eng = Engine::new(&mut repo, &keys, DigestCache::memory_only());
-            match verify_target_with_engine(&mut eng, oid, None, None, true) {
+            match verify_target_with_engine(&mut eng, oid, None, None, false) {
                 Ok(CheckOutcome::Match { digest, .. })
                 | Ok(CheckOutcome::NoEvidence { digest, .. }) => digest,
                 Err(e) => {
                     eprintln!(
-                        "buttress: refusing to mint +blake3- tag for {tag_name}: {}",
+                        "buttress: refusing to mint +blake3- tag for {}: {}",
+                        sanitize_for_tty(tag_name),
                         e.message
                     );
                     continue;
@@ -1003,6 +1029,9 @@ fn wrap_git_commit(
 
     let mut repo = match GitRepo::open_with_global_args(None, global_args) {
         Ok(r) => r,
+        Err(msg) if msg.contains("object-format=") || msg.contains("not a git repository") => {
+            return 0;
+        }
         Err(e) => {
             eprintln!("git-buttress: commit succeeded, but reopening repository failed: {e}");
             return 1;
@@ -1193,7 +1222,17 @@ pub fn fsck_all_refs(
     policy_override: Option<&str>,
 ) -> Result<(usize, usize), String> {
     let policy = MissingPolicy::from_repo(repo, policy_override)?;
+    // 1. Validate ref-database structural integrity FIRST (`git refs verify` — `R2-H1` fix)!
+    repo.run(["refs", "verify"], None)
+        .map_err(|e| format!("buttress fsck: ref database verification failed: {e}"))?;
+
     let out = repo.run(["for-each-ref", "--format=%(objectname) %(refname)%00"], None)?;
+    if !out.stderr.is_empty() {
+        return Err(format!(
+            "buttress fsck: ref enumeration reported warnings/broken refs: {}",
+            sanitize_for_tty(String::from_utf8_lossy(&out.stderr).trim())
+        ));
+    }
 
     let mut refs: Vec<(Oid, Vec<u8>)> = Vec::new();
     for rec in out.stdout.split(|&b| b == 0) {
@@ -1210,9 +1249,34 @@ pub fn fsck_all_refs(
         refs.push((oid, ref_bytes));
     }
 
-    // Include detached HEAD if not symbolic (`H3` fix)
-    if let Ok((None, head_oid)) = read_head_state(repo) {
-        refs.push((head_oid, b"HEAD".to_vec()));
+    // Check HEAD explicitly (`R2-H1` fix: distinguish symbolic unborn branch vs detached vs corrupt HEAD!)
+    let sym_out = repo
+        .cmd()
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map_err(|e| format!("buttress fsck: symbolic-ref HEAD: {e}"))?;
+    match sym_out.status.code() {
+        Some(0) => {
+            // Symbolic HEAD: either resolves (already in `for-each-ref`) or is a valid unborn branch!
+            let sym_name = String::from_utf8_lossy(&sym_out.stdout).trim().to_string();
+            if !sym_name.starts_with("refs/heads/") {
+                return Err(format!("buttress fsck: symbolic HEAD points outside refs/heads/: {}", sanitize_for_tty(&sym_name)));
+            }
+        }
+        Some(1) => {
+            // Detached HEAD: MUST resolve to a valid commit/object OID!
+            let head_oid = repo
+                .rev_parse("HEAD")
+                .map_err(|e| format!("buttress fsck: corrupt detached HEAD: {e}"))?;
+            refs.push((head_oid, b"HEAD".to_vec()));
+        }
+        _ => {
+            return Err(format!(
+                "buttress fsck: corrupt HEAD: {}",
+                sanitize_for_tty(String::from_utf8_lossy(&sym_out.stderr).trim())
+            ));
+        }
     }
 
     // Exact companion tag pairing (`refs/tags/<X>` paired only with `refs/tags/<X>+blake3-...` at same OID)
@@ -1284,9 +1348,9 @@ pub fn fsck_all_refs(
     Ok((matched_refs, no_evidence_refs))
 }
 
-/// All standard Git hooks (`githooks(5)`), so setting `core.hooksPath` chains **every**
-/// user/repository hook (both a prior `core.hooksPath` AND `.git/hooks/<name>`!) (`H10` fix).
-const ALL_GIT_HOOKS: &[&str] = &[
+/// Standard Git hooks (`githooks(5)`), EXCLUDING `push-to-checkout` and `proc-receive` whose
+/// mere presence as executable files alters Git's built-in server/worktree semantics (`R2-H5` fix)!
+const FORWARDED_GIT_HOOKS: &[&str] = &[
     "applypatch-msg",
     "pre-applypatch",
     "post-applypatch",
@@ -1301,15 +1365,12 @@ const ALL_GIT_HOOKS: &[&str] = &[
     "pre-push",
     "pre-receive",
     "update",
-    "proc-receive",
     "post-receive",
     "post-update",
     "reference-transaction",
-    "push-to-checkout",
     "pre-auto-gc",
     "post-rewrite",
     "sendemail-validate",
-    "fsmonitor-watchman",
     "p4-changelist",
     "p4-prepare-changelist",
     "p4-post-changelist",
@@ -1374,9 +1435,8 @@ pub fn enable_buttress(
         .to_str()
         .ok_or("hooks directory path is not valid UTF-8")?;
 
-    // Write forwarding stubs for ALL standard Git hooks so pre-commit / pre-push / etc. in a
-    // prior `core.hooksPath` OR in `.git/hooks/` continue firing!
-    for &hook_name in ALL_GIT_HOOKS {
+    // Write forwarding stubs for safe standard Git hooks (excluding `push-to-checkout` & `proc-receive`!).
+    for &hook_name in FORWARDED_GIT_HOOKS {
         let script = match hook_name {
             "post-commit" => format!(
                 "#!/bin/sh\n{fwd}{exe} seal-head --quiet\n",
@@ -1545,7 +1605,7 @@ pub fn disable_buttress(global: bool, wrapper_dir: Option<&Path>) -> Result<(), 
 
     // Remove generated hook scripts
     if hooks_dir.is_dir() {
-        for &h in ALL_GIT_HOOKS {
+        for &h in FORWARDED_GIT_HOOKS {
             let _ = fs::remove_file(hooks_dir.join(h));
         }
         let _ = fs::remove_file(&state_file);
@@ -1626,11 +1686,14 @@ fn forward_hook_no_stdin(
          fi\n"
     );
     match prev_dir {
+        // Match stock Git semantics (`R2-H5` fix): when a prior `core.hooksPath` was configured,
+        // dispatch ONLY to that directory — do NOT fall back to `$COMMON_DIR/hooks`, which would
+        // unexpectedly re-enable hooks the user had disabled via `core.hooksPath`!
         Some(d) => {
             let p_q = posix_single_quote(&format!("{}/{hook_name}", d.trim_end_matches('/')));
             format!(
-                "if [ -z \"${{{guard_var}:-}}\" ]; then\n\
-                   if [ -x {p_q} ]; then {guard_var}=1 {p_q} \"$@\" || exit $?; else {find_local} fi\n\
+                "if [ -z \"${{{guard_var}:-}}\" ] && [ -x {p_q} ]; then\n\
+                   {guard_var}=1 {p_q} \"$@\" || exit $?\n\
                  fi\n"
             )
         }
@@ -1664,9 +1727,8 @@ fn forward_hook_passthrough_stdin(
         Some(d) => {
             let p_q = posix_single_quote(&format!("{}/{hook_name}", d.trim_end_matches('/')));
             format!(
-                "if [ -z \"${{{guard_var}:-}}\" ]; then\n\
-                   if [ -x {p_q} ]; then export {guard_var}=1; exec {p_q} \"$@\"; fi\n\
-                   {find_local}\
+                "if [ -z \"${{{guard_var}:-}}\" ] && [ -x {p_q} ]; then\n\
+                   export {guard_var}=1; exec {p_q} \"$@\"\n\
                  fi\n"
             )
         }
@@ -1695,12 +1757,7 @@ fn forward_reference_transaction(
             ));
             format!(
                 "PREV_HOOK=\"\"\n\
-                 if [ -z \"${{GIT_BUTTRESS_FWD_REFTX:-}}\" ]; then\n\
-                   if [ -x {p_q} ]; then PREV_HOOK={p_q}; else\n\
-                     COMMON_DIR=$({real_q} rev-parse --git-common-dir 2>/dev/null || true)\n\
-                     if [ -n \"$COMMON_DIR\" ] && [ -x \"$COMMON_DIR/hooks/reference-transaction\" ]; then PREV_HOOK=\"$COMMON_DIR/hooks/reference-transaction\"; fi\n\
-                   fi\n\
-                 fi"
+                 if [ -z \"${{GIT_BUTTRESS_FWD_REFTX:-}}\" ] && [ -x {p_q} ]; then PREV_HOOK={p_q}; fi"
             )
         }
         None => format!(

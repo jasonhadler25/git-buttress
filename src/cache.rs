@@ -66,6 +66,11 @@ impl DigestCache {
         }
     }
 
+    #[inline]
+    pub fn is_memory_only(&self) -> bool {
+        self.disk_path.is_none()
+    }
+
     /// Contract:
     /// - `requires`: `git_dir` is a repository common git directory.
     /// - `ensures`: returns `c` satisfying `I_cache(c)` with `c.disk_path == Some(git_dir.join("buttress-cache.bin"))`

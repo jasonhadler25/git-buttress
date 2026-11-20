@@ -193,6 +193,12 @@ impl StoreError {
 /// arbitrary objects in memory to simulate SHA1DC collisions!
 pub trait ObjectStore {
     fn has_object(&mut self, oid: &Oid) -> Result<bool, StoreError>;
+    fn object_info(&mut self, oid: &Oid) -> Result<Option<(ObjKind, u64)>, StoreError> {
+        let Some((kind, raw)) = self.read_object(oid)? else {
+            return Ok(None);
+        };
+        Ok(Some((kind, raw.len() as u64)))
+    }
     fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, StoreError>;
     fn hash_blob(&mut self, oid: &Oid, keys: &ContextKeys) -> Result<Option<(ObjKind, Dig)>, StoreError> {
         let Some((kind, raw)) = self.read_object(oid)? else {
@@ -249,6 +255,7 @@ impl GitRepo {
         c.args([
             "--no-replace-objects",
             "rev-parse",
+            "--path-format=absolute",
             "--git-dir",
             "--git-common-dir",
             "--show-object-format",
@@ -281,9 +288,9 @@ impl GitRepo {
         }
         let gd_raw = bytes_to_pathbuf(lines[0])?;
         let cd_raw = bytes_to_pathbuf(lines[1])?;
-        let git_dir = if gd_raw.is_absolute() { gd_raw } else { cwd.join(gd_raw) };
-        let common_dir = if cd_raw.is_absolute() { cd_raw } else { cwd.join(cd_raw) };
-        let shallow = load_shallow_set(&git_dir, &common_dir)?;
+        let git_dir = fs::canonicalize(&gd_raw).unwrap_or(gd_raw);
+        let common_dir = fs::canonicalize(&cd_raw).unwrap_or(cd_raw);
+        let shallow = load_shallow_set(&common_dir)?;
 
         Ok(Self {
             real_git,
@@ -463,7 +470,7 @@ impl GitRepo {
         hex_to_oid(out.stdout.trim_ascii())
     }
 
-    fn has_object_inner(&mut self, oid: &Oid) -> Result<bool, StoreError> {
+    fn object_info_inner(&mut self, oid: &Oid) -> Result<Option<(ObjKind, u64)>, StoreError> {
         let hex = to_hex(oid);
         let b = self.ensure_batch_check()?;
         b.stdin
@@ -488,12 +495,17 @@ impl GitRepo {
             return Err(StoreError::io("cat-file --batch-check echoed unexpected OID"));
         }
         if parts.len() == 2 && parts[1] == b"missing" {
-            return Ok(false);
+            return Ok(None);
         }
         if parts.len() != 3 {
             return Err(StoreError::io("malformed cat-file --batch-check header"));
         }
-        Ok(true)
+        let kind = ObjKind::from_bytes(parts[1]).map_err(StoreError::io)?;
+        let size: u64 = std::str::from_utf8(parts[2])
+            .map_err(|_| StoreError::io("non-utf8 size in --batch-check"))?
+            .parse()
+            .map_err(|_| StoreError::io("invalid object size in --batch-check"))?;
+        Ok(Some((kind, size)))
     }
 
     fn read_object_inner(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, StoreError> {
@@ -532,9 +544,9 @@ impl GitRepo {
             .map_err(|_| StoreError::io("non-utf8 size"))?
             .parse()
             .map_err(|_| StoreError::io("invalid object size"))?;
-        if kind != ObjKind::Blob && size > MAX_METADATA_OBJECT_BYTES {
+        if size > MAX_METADATA_OBJECT_BYTES {
             return Err(StoreError::io(format!(
-                "{} object {} exceeds {} MiB metadata cap ({size} bytes)",
+                "{} object {} exceeds {} MiB in-memory read cap ({size} bytes; blobs must use hash_blob)",
                 kind.as_str(),
                 hex,
                 MAX_METADATA_OBJECT_BYTES >> 20
@@ -627,7 +639,11 @@ impl GitRepo {
 
 impl ObjectStore for GitRepo {
     fn has_object(&mut self, oid: &Oid) -> Result<bool, StoreError> {
-        let res = self.has_object_inner(oid);
+        Ok(self.object_info(oid)?.is_some())
+    }
+
+    fn object_info(&mut self, oid: &Oid) -> Result<Option<(ObjKind, u64)>, StoreError> {
+        let res = self.object_info_inner(oid);
         if res.is_err() {
             self.batch_check = None;
         }
@@ -668,28 +684,33 @@ fn bytes_to_pathbuf(bytes: &[u8]) -> Result<PathBuf, String> {
     }
 }
 
-fn load_shallow_set(git_dir: &Path, common_dir: &Path) -> Result<HashSet<Oid>, String> {
+/// Match upstream Git `shallow.c:setup_alternate_shallow`: `GIT_SHALLOW_FILE` replaces
+/// `$GIT_COMMON_DIR/shallow` (and an empty `GIT_SHALLOW_FILE=""` means no shallow file!).
+fn load_shallow_set(common_dir: &Path) -> Result<HashSet<Oid>, String> {
     let mut set = HashSet::new();
-    let mut candidates = vec![common_dir.join("shallow"), git_dir.join("shallow")];
-    if let Ok(alt) = env::var("GIT_SHALLOW_FILE") {
-        candidates.push(PathBuf::from(alt));
-    }
-    for path in candidates {
-        let bytes = match fs::read(&path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("failed to read shallow file {}: {e}", path.display())),
-        };
-        for line in bytes.split(|&b| b == b'\n') {
-            let trimmed = line.trim_ascii();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let oid = hex_to_oid(trimmed).map_err(|e| {
-                format!("corrupt shallow file {}: {e}", path.display())
-            })?;
-            set.insert(oid);
+    let shallow_path = match env::var_os("GIT_SHALLOW_FILE") {
+        Some(alt) if alt.is_empty() => return Ok(set),
+        Some(alt) => PathBuf::from(alt),
+        None => common_dir.join("shallow"),
+    };
+    let bytes = match fs::read(&shallow_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(set),
+        Err(e) => {
+            return Err(format!(
+                "failed to read shallow file {}: {e}",
+                shallow_path.display()
+            ));
         }
+    };
+    for line in bytes.split(|&b| b == b'\n') {
+        let trimmed = line.trim_ascii();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let oid = hex_to_oid(trimmed)
+            .map_err(|e| format!("corrupt shallow file {}: {e}", shallow_path.display()))?;
+        set.insert(oid);
     }
     Ok(set)
 }

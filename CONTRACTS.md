@@ -102,8 +102,9 @@ Over an acyclic subgraph in `objects(S)`:
    `GIT_BUTTRESS_REAL_GIT` is unset or corrupted to point at the wrapper.
 4. **TB-4 (Dependency note — `blake3-servil` 0.9.1):** `Cargo.toml` depends on
    `blake3-servil` `0.9.1` with default features (`std` only; `zeroize` is
-   **not** enabled). Every hash call in `git-buttress` uses
-   `convenience::hash_with(Mode::DeriveKeyWith(&ContextKey), slice)`—never
+   **not** enabled). Every hash computation in `git-buttress` uses either
+   `convenience::hash_with(Mode::DeriveKeyWith(&ContextKey), slice)` or a fresh
+   per-blob `convenience::Hasher::new(Mode::DeriveKeyWith(&ContextKey), ...)`—never
    `Zeroize` and never `throughput::update_each`—so GHSA-v237-j9h9-8pf7 does not
    affect `git-buttress`.
 

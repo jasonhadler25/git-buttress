@@ -202,38 +202,31 @@ fn cmd_id(args: &[String]) -> Result<i32, String> {
     seen_tags.insert(oid);
 
     loop {
-        let (kind, raw) = repo
-            .read_object(&oid)
+        let (kind, _) = repo
+            .object_info(&oid)
             .map_err(|e| e.message)?
             .ok_or_else(|| format!("missing object {}", to_hex(&oid)))?;
         match kind {
             ObjKind::Tag => {
-                let (next_oid, decl_kind, _) =
+                let (_, raw) = repo
+                    .read_object(&oid)
+                    .map_err(|e| e.message)?
+                    .ok_or_else(|| format!("missing object {}", to_hex(&oid)))?;
+                let (next_oid, decl_kind, trailer_dig) =
                     parse_annotated_tag(&raw).map_err(|e| e.message)?;
+                if decl_kind == ObjKind::Tag && trailer_dig.is_some() {
+                    return Err(
+                        "Buttress-Object trailer on a tag-to-tag object is ambiguous".into(),
+                    );
+                }
                 if !seen_tags.insert(next_oid) {
                     return Err(format!(
                         "cycle in annotated tag chain at {}",
                         to_hex(&next_oid)
                     ));
                 }
-                // Check declared target kind matches stored object kind!
-                if decl_kind == ObjKind::Blob {
-                    let (actual_kind, d) = repo
-                        .hash_blob(&next_oid, &keys)
-                        .map_err(|e| e.message)?
-                        .ok_or_else(|| format!("missing object {}", to_hex(&next_oid)))?;
-                    if actual_kind != ObjKind::Blob {
-                        return Err(format!(
-                            "tag declared target type blob, but object {} is {}",
-                            to_hex(&next_oid),
-                            actual_kind.as_str()
-                        ));
-                    }
-                    println!("{}", to_hex(&d));
-                    return Ok(0);
-                }
                 let (actual_kind, _) = repo
-                    .read_object(&next_oid)
+                    .object_info(&next_oid)
                     .map_err(|e| e.message)?
                     .ok_or_else(|| format!("missing object {}", to_hex(&next_oid)))?;
                 if actual_kind != decl_kind {
@@ -354,23 +347,26 @@ fn cmd_check(args: &[String]) -> Result<i32, String> {
             target_oid,
             digest,
             ancestors_sealed_checked,
+            shallow_stops,
         }) => match policy {
             MissingPolicy::Silent => Ok(0),
             MissingPolicy::Warn => {
                 eprintln!(
-                    "NO EVIDENCE for {} (computed blake3: {}; {} ancestor seal(s) checked)",
+                    "NO EVIDENCE for {} (computed blake3: {}; {} ancestor seal(s) checked, {} shallow stop(s))",
                     to_hex(&target_oid),
                     to_hex(&digest),
-                    ancestors_sealed_checked
+                    ancestors_sealed_checked,
+                    shallow_stops
                 );
                 Ok(0)
             }
             MissingPolicy::Error => {
                 eprintln!(
-                    "NO EVIDENCE for {} (computed blake3: {}; {} ancestor seal(s) checked)",
+                    "NO EVIDENCE for {} (computed blake3: {}; {} ancestor seal(s) checked, {} shallow stop(s))",
                     to_hex(&target_oid),
                     to_hex(&digest),
-                    ancestors_sealed_checked
+                    ancestors_sealed_checked,
+                    shallow_stops
                 );
                 Ok(2)
             }

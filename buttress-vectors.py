@@ -11,7 +11,7 @@ sys.setrecursionlimit(1_000_000)
 
 APP = "git-buttress 2026-11-20 "
 CTX_FILE, CTX_DIR = APP + "file", APP + "directory"
-CTX_COMMIT, CTX_PLAIN = APP + "plain commit" and APP + "commit", APP + "plain commit"
+CTX_COMMIT, CTX_PLAIN = APP + "commit", APP + "plain commit"
 HEX40 = re.compile(rb"^[0-9a-f]{40}$")
 HEX64 = re.compile(rb"^[0-9a-f]{64}$")
 ALG_RE = re.compile(rb"^[a-z][a-z0-9-]*$")
