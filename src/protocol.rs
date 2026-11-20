@@ -1,4 +1,24 @@
 //! Core `git-buttress` protocol (implements `BUTTRESS.md` to the byte).
+//!
+//! # Module Contract
+//!
+//! - **Pure mathematical specification (`spec_digest_*`):**
+//!   Let `dk(ctx, msg)` be 32-byte BLAKE3 derive-key output over UTF-8 `ctx` and bytes `msg`.
+//!   - `spec_file(raw) = dk(CTX_FILE, raw)`
+//!   - `spec_dir(entries) = dk(CTX_DIR, concat_i(mode_i || " " || name_i || "\0" || child_i))`
+//!     where `child_i` is `spec_dir(sub)` (32B) if `octal(mode_i) == 0o040000`, raw 20-byte `oid_i`
+//!     if `octal(mode_i) == 0o160000`, else `spec_file(blob)` (32B).
+//!   - `spec_commit(C)`:
+//!     - If `C` is `Sealed`, `dk(CTX_COMMIT, C.raw)`.
+//!     - If `C` is `Plain` or `Stale`,
+//!       `dk(CTX_PLAIN, spec_dir(C.tree) || u32_le(k) || spec_commit(P_1) || ... || spec_commit(P_k) || C.raw)`.
+//! - **Engine invariant `I(eng)`:**
+//!   1. Every entry in `eng.parsed[oid]` equals `parse_commit(oid, raw)` for the object returned by `eng.store`.
+//!   2. When initialized with `DigestCache::memory_only()`, every cached digest in `eng.cache` equals
+//!      the `spec_*` value computed directly from `eng.store` in the current run.
+//!   3. Commit parent counts are bounded to `u32::MAX` (`try_from`) so `u32_le(k)` never truncates.
+//!   4. Tree traversal tracks `in_progress_trees` to detect malformed cyclic tree objects cleanly with
+//!      `VerifyErrorKind::Mismatch` rather than looping forever.
 
 use crate::cache::{Dig, DigestCache, Oid, OidMap};
 use crate::git::{ObjKind, ObjectStore, hex_to_32, hex_to_oid, to_hex};
@@ -106,11 +126,23 @@ impl VerifyError {
     }
 }
 
+/// Split raw commit/tag object bytes at the header/body boundary (`\n\n` or single-`\n` header-only).
+///
+/// Contract:
+/// - `requires`: true
+/// - `ensures`:
+///   - If `raw` begins with `b'\n'` (empty header block), returns `(&b""[..], &raw[1..])`.
+///   - Else if `raw` contains `b"\n\n"` at earliest byte index `pos`, returns `(&raw[..pos], &raw[pos + 2..])`.
+///   - Else (header-only object with no body), strips at most a single trailing `b'\n'` (never spaces/tabs)
+///     and returns `(header_without_final_lf, &b""[..])`.
+/// - `writes`: nothing (pure slice view).
 pub fn split_headers_body(raw: &[u8]) -> (&[u8], &[u8]) {
-    if let Some(pos) = raw.windows(2).position(|w| w == b"\n\n") {
+    if let Some(rest) = raw.strip_prefix(b"\n") {
+        (&[], rest)
+    } else if let Some(pos) = raw.windows(2).position(|w| w == b"\n\n") {
         (&raw[..pos], &raw[pos + 2..])
     } else {
-        (raw.trim_ascii_end(), b"")
+        (raw.strip_suffix(b"\n").unwrap_or(raw), b"")
     }
 }
 
@@ -123,6 +155,19 @@ fn is_valid_alg_token(alg: &[u8]) -> bool {
 }
 
 /// Parse a Git commit and classify its `blake3` buttress lines per `BUTTRESS.md` §§2, 4.
+///
+/// Contract:
+/// - `requires`: `raw` is the uncompressed payload of commit `oid`.
+/// - `ensures`:
+///   - Returns `Err(Mismatch)` if `raw` has zero or >1 `tree` headers, any invalid hex `tree`/`parent` OID,
+///     an invalid algorithm token on a `buttress-*` header, >1 `buttress-tree blake3` lines, `buttress-parent blake3`
+///     without `buttress-tree blake3`, malformed `blake3` arguments, or (`bt_tree == tree` and `b3_parents.len() != parents.len()`).
+///   - Returns `Ok(pc)` with `pc.class == Sealed` iff there is 1 `buttress-tree blake3 <tree> <d>` with `<tree> == pc.tree`
+///     and `pc.parents.len()` `buttress-parent blake3` lines.
+///   - Returns `Ok(pc)` with `pc.class == Stale` iff there is 1 `buttress-tree blake3 <other> <d>` with `<other> != pc.tree`
+///     and every `buttress-parent blake3` line is syntactically well-formed.
+///   - Returns `Ok(pc)` with `pc.class == Plain` iff there are 0 `buttress-tree blake3` and 0 `buttress-parent blake3` lines.
+/// - `writes`: nothing.
 pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError> {
     let (header_bytes, _) = split_headers_body(&raw);
     let mut tree: Option<Oid> = None;
@@ -137,6 +182,12 @@ pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError>
             continue;
         }
         if let Some(rest) = line.strip_prefix(b"tree ") {
+            if tree.is_some() {
+                return Err(VerifyError::mismatch(format!(
+                    "commit {}: duplicate tree header",
+                    to_hex(&oid)
+                )));
+            }
             let t = hex_to_oid(rest).map_err(|e| {
                 VerifyError::mismatch(format!("commit {}: invalid tree line: {e}", to_hex(&oid)))
             })?;
@@ -263,6 +314,13 @@ pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError>
 }
 
 /// Parse raw Git tree entries: `(mode_bytes, octal_mode, name_bytes, child_oid)`.
+///
+/// Contract:
+/// - `requires`: true
+/// - `ensures`: on `Ok(entries)`, `raw` is the exact concatenation of `mode_bytes || b" " || name || b"\0" || child`
+///   for each entry, where `1 <= mode_bytes.len() <= 7` of ASCII `'0'..='7'` (no `u32` overflow), `name` is non-empty
+///   and contains no NUL (`0x00`) or `'/'` (`0x2f`), and `child` is 20 bytes. Returns `Err(Mismatch)` on any violation.
+/// - `writes`: nothing.
 pub fn parse_tree_entries(raw: &[u8]) -> Result<Vec<(&[u8], u32, &[u8], Oid)>, VerifyError> {
     let mut entries = Vec::new();
     let mut i = 0;
@@ -274,8 +332,11 @@ pub fn parse_tree_entries(raw: &[u8]) -> Result<Vec<(&[u8], u32, &[u8], Oid)>, V
             .ok_or_else(|| VerifyError::mismatch("malformed tree: missing space"))?;
         let sp = i + rel_sp;
         let mode_bytes = &raw[i..sp];
-        if mode_bytes.is_empty() || !mode_bytes.iter().all(|&c| (b'0'..=b'7').contains(&c)) {
-            return Err(VerifyError::mismatch("malformed tree: non-octal mode"));
+        if mode_bytes.is_empty()
+            || mode_bytes.len() > 7
+            || !mode_bytes.iter().all(|&c| (b'0'..=b'7').contains(&c))
+        {
+            return Err(VerifyError::mismatch("malformed tree: invalid octal mode"));
         }
         let octal = mode_bytes
             .iter()
@@ -289,6 +350,9 @@ pub fn parse_tree_entries(raw: &[u8]) -> Result<Vec<(&[u8], u32, &[u8], Oid)>, V
             return Err(VerifyError::mismatch("malformed tree: truncated child OID"));
         }
         let name = &raw[sp + 1..nul];
+        if name.is_empty() || name.contains(&b'/') {
+            return Err(VerifyError::mismatch("malformed tree: empty or slash-containing entry name"));
+        }
         let child: Oid = raw[nul + 1..nul + 21].try_into().unwrap();
         entries.push((mode_bytes, octal, name, child));
         i = nul + 21;
@@ -358,19 +422,36 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
         Ok(d)
     }
 
+    /// Compute `spec_dir(root_oid)` iteratively with cycle detection.
+    ///
+    /// Contract:
+    /// - `requires`: `I(self)`
+    /// - `ensures`: on `Ok(d)`, `d == spec_dir(root_oid)` and `self.cache.trees[&root_oid] == d`.
+    ///   Returns `Err(Incomplete)` if any reachable tree or blob is missing from `self.store`,
+    ///   or `Err(Mismatch)` on wrong object type, malformed tree syntax, or a tree cycle.
+    /// - `writes`: `self.store`, `self.cache.trees`, `self.cache.blobs`.
     pub fn digest_tree(&mut self, root_oid: Oid) -> Result<Dig, VerifyError> {
         if let Some(&d) = self.cache.trees.get(&root_oid) {
             return Ok(d);
         }
-        // Iterative post-order traversal
+        // Iterative post-order traversal with explicit cycle detection
         let mut stack: Vec<(Oid, Option<Vec<u8>>)> = vec![(root_oid, None)];
+        let mut in_progress: HashSet<Oid> = HashSet::new();
+
         while let Some((oid, raw_opt)) = stack.pop() {
             if self.cache.trees.contains_key(&oid) {
+                in_progress.remove(&oid);
                 continue;
             }
             let raw = match raw_opt {
                 Some(r) => r,
                 None => {
+                    if !in_progress.insert(oid) {
+                        return Err(VerifyError::mismatch(format!(
+                            "cycle in directory tree at {}",
+                            to_hex(&oid)
+                        )));
+                    }
                     let (kind, r) = self
                         .store
                         .read_object(&oid)
@@ -392,6 +473,13 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
             let mut missing_subtrees = Vec::new();
             for &(_, octal, _, child) in &entries {
                 if octal == MODE_DIR && !self.cache.trees.contains_key(&child) {
+                    if in_progress.contains(&child) {
+                        return Err(VerifyError::mismatch(format!(
+                            "cycle in directory tree: {} -> {}",
+                            to_hex(&oid),
+                            to_hex(&child)
+                        )));
+                    }
                     missing_subtrees.push(child);
                 }
             }
@@ -403,6 +491,7 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
                 continue;
             }
 
+            in_progress.remove(&oid);
             let mut buf = Vec::with_capacity(raw.len() + entries.len() * 12);
             for (mode_bytes, octal, name, child) in entries {
                 buf.extend_from_slice(mode_bytes);
@@ -424,7 +513,16 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
         Ok(self.cache.trees[&root_oid])
     }
 
-    /// Compute `commit_digest(oid)` per `BUTTRESS.md` §3, returning `(digest, sealed_ancestors_reached)`.
+    /// Compute `commit_digest(root_oid)` per `BUTTRESS.md` §3, returning `(digest, sealed_ancestors_reached)`.
+    ///
+    /// Contract:
+    /// - `requires`: `I(self)`
+    /// - `ensures`: on `Ok((d, sealed_ancs))`, `d == spec_commit(root_oid)` and `sealed_ancs` contains
+    ///   every `Sealed` commit directly bounding any `Plain`/`Stale` ancestor walk under `root_oid`
+    ///   (or `[root_oid]` if `root_oid` was already cached and `Sealed`).
+    ///   Returns `Err(Incomplete)` if an unsealed commit sits on a `.git/shallow` boundary with missing
+    ///   parents or if any required object is missing; returns `Err(Mismatch)` on malformed objects or cycles.
+    /// - `writes`: `self.store`, `self.cache`, `self.parsed`.
     pub fn digest_commit(&mut self, root_oid: Oid) -> Result<(Dig, Vec<Oid>), VerifyError> {
         let mut discovered_sealed = Vec::new();
         if let Some(&d) = self.cache.commits.get(&root_oid) {
@@ -459,17 +557,24 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
                         to_hex(&cur)
                     )));
                 }
-                if pc.parents.iter().any(|_| self.store.shallow_commits().contains(&cur)) {
-                    return Err(VerifyError::incomplete(format!(
-                        "shallow boundary at plain commit {} cuts across unsealed history",
-                        to_hex(&cur)
-                    )));
+                if !pc.parents.is_empty() && self.store.shallow_commits().contains(&cur) {
+                    // Only treat as incomplete if at least one parent is actually missing from the store
+                    for &p in &pc.parents {
+                        if self.store.read_object(&p).map_err(VerifyError::incomplete)?.is_none() {
+                            return Err(VerifyError::incomplete(format!(
+                                "shallow boundary at plain commit {} cuts across unsealed history (missing parent {})",
+                                to_hex(&cur),
+                                to_hex(&p)
+                            )));
+                        }
+                    }
                 }
                 stack.push((cur, true));
                 for &p in pc.parents.iter().rev() {
                     if !self.cache.commits.contains_key(&p) {
                         stack.push((p, false));
-                    } else if let Some(ppc) = self.parsed.get(&p) {
+                    } else {
+                        let ppc = self.load_commit(p)?;
                         if matches!(ppc.class, CommitClass::Sealed { .. }) {
                             discovered_sealed.push(p);
                         }
@@ -477,10 +582,12 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
                 }
             } else {
                 in_progress.remove(&cur);
+                let k_u32 = u32::try_from(pc.parents.len())
+                    .map_err(|_| VerifyError::mismatch("commit has > u32::MAX parents"))?;
                 let tree_dig = self.digest_tree(pc.tree)?;
                 let mut buf = Vec::with_capacity(32 + 4 + pc.parents.len() * 32 + pc.raw.len());
                 buf.extend_from_slice(&tree_dig);
-                buf.extend_from_slice(&(pc.parents.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&k_u32.to_le_bytes());
                 for p in &pc.parents {
                     buf.extend_from_slice(&self.cache.commits[p]);
                 }
@@ -496,13 +603,29 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
 
 /// Extract `+blake3-<64-hex>` embedded in a tag or ref name, e.g.
 /// `refs/tags/v2.4.0+blake3-71e4...` or `v2.4.0+blake3-71e4...`.
+///
+/// Contract:
+/// - `requires`: true
+/// - `ensures`:
+///   - If `ref_or_name` contains zero occurrences of `"+blake3-"`, returns `Ok(None)`.
+///   - If `ref_or_name` contains `>= 2` occurrences of `"+blake3-"`, returns `Err(Mismatch)`
+///     (prevents duplicate-segment confusion such as `v1+blake3-<good>+blake3-<evil>`).
+///   - If `ref_or_name` contains exactly 1 `"+blake3-"`, parses the token up to the next `'+'` or `'/'`
+///     (or `^{}` peel suffix) as 64 lowercase hex chars (`[0-9a-f]{64}`), returning `Ok(Some(dig))` or `Err(Mismatch)`.
+/// - `writes`: nothing.
 pub fn parse_ref_embedded_b3(ref_or_name: &str) -> Result<Option<Dig>, VerifyError> {
-    let Some(idx) = ref_or_name.find("+blake3-") else {
+    let mut matches = ref_or_name.match_indices("+blake3-");
+    let Some((idx, _)) = matches.next() else {
         return Ok(None);
     };
+    if matches.next().is_some() {
+        return Err(VerifyError::mismatch(format!(
+            "duplicate +blake3- segments in ref {ref_or_name:?}"
+        )));
+    }
     let rest = &ref_or_name[idx + "+blake3-".len()..];
-    // Allow e.g. another `+` or `.` extension segment later if ever needed, otherwise take 64 hex
-    let token = rest.split(['+', '/']).next().unwrap_or(rest);
+    let rest = rest.strip_suffix("^{}").unwrap_or(rest);
+    let token = rest.split(['+', '/', '^', '~']).next().unwrap_or(rest);
     let dig = hex_to_32(token.as_bytes()).map_err(|e| {
         VerifyError::mismatch(format!(
             "malformed +blake3- digest in ref {ref_or_name:?}: {e}"
@@ -626,10 +749,12 @@ pub fn verify_target<S: ObjectStore>(
         .ok_or_else(|| VerifyError::incomplete(format!("missing object {}", to_hex(&start_oid))))?;
     let mut target_oid = start_oid;
 
-    // Peel annotated tag(s)
+    // Peel annotated tag(s), guarding against cyclic tag chains!
     let mut raw_cur = raw;
+    let mut seen_tags: HashSet<Oid> = HashSet::new();
+    seen_tags.insert(start_oid);
     while cur_kind == ObjKind::Tag {
-        let (next_oid, next_kind, trailer_dig) = parse_annotated_tag(&raw_cur)?;
+        let (next_oid, decl_kind, trailer_dig) = parse_annotated_tag(&raw_cur)?;
         if let (Some(exp), Some(td)) = (expect, trailer_dig) {
             if !ct_eq(&exp, &td) {
                 return Err(VerifyError::mismatch(format!(
@@ -643,15 +768,28 @@ pub fn verify_target<S: ObjectStore>(
             expect = trailer_dig;
         }
         target_oid = next_oid;
-        cur_kind = next_kind;
+        let (actual_kind, r2) = store
+            .read_object(&target_oid)
+            .map_err(VerifyError::incomplete)?
+            .ok_or_else(|| {
+                VerifyError::incomplete(format!("missing tagged object {}", to_hex(&target_oid)))
+            })?;
+        if actual_kind != decl_kind {
+            return Err(VerifyError::mismatch(format!(
+                "tag declared target type {}, but object {} is {}",
+                decl_kind.as_str(),
+                to_hex(&target_oid),
+                actual_kind.as_str()
+            )));
+        }
+        cur_kind = actual_kind;
         if cur_kind == ObjKind::Tag {
-            let (k2, r2) = store
-                .read_object(&target_oid)
-                .map_err(VerifyError::incomplete)?
-                .ok_or_else(|| {
-                    VerifyError::incomplete(format!("missing tagged object {}", to_hex(&target_oid)))
-                })?;
-            cur_kind = k2;
+            if !seen_tags.insert(target_oid) {
+                return Err(VerifyError::mismatch(format!(
+                    "cycle in annotated tag chain at {}",
+                    to_hex(&target_oid)
+                )));
+            }
             raw_cur = r2;
         }
     }

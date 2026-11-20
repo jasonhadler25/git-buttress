@@ -226,9 +226,12 @@ cargo test --release
 
 * [`src/`](src/) & [`Cargo.toml`](Cargo.toml) — Rust implementation of
   `git-buttress` built on [`blake3-servil`](https://github.com/servil-software-factory/BLAKE3).
+* [`CONTRACTS.md`](CONTRACTS.md) — Design-by-Contract (Hoare/Meyer/Ode-style)
+  specifications, representation invariants, and trust boundaries for every
+  module, stateful type, hook, wrapper, and CLI subcommand.
 * [`tests/integration.rs`](tests/integration.rs) — End-to-end tests of the
-  Maya/Dana/Sam workflow, SSH signing, `rebase`/`amend`, shallow boundaries, and
-  simulated SHA1DC collision/second-preimage attacks.
+  Maya/Dana/Sam workflow, SSH signing, `rebase`/`amend`, shallow boundaries,
+  contract edge cases, and simulated SHA1DC collision/second-preimage attacks.
 * [`BUTTRESS.md`](BUTTRESS.md) — Specification of `git-buttress` (wire headers,
   BLAKE3 context-string derivations, verification rules, safety argument, test
   vectors, and full Linux-kernel benchmark numbers: **1 min 18 s** for all 1.5M

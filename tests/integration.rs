@@ -613,3 +613,252 @@ fn adversarial_sha1dc_collision_and_shallow_boundary_tests() {
         ));
     }
 }
+
+#[test]
+fn contract_obligations_found_during_dbc_pass() {
+    let keys = ContextKeys::new();
+
+    // 1. split_headers_body: leading `\n` (empty header block) and header-only commit with trailing spaces
+    assert_eq!(
+        git_buttress::protocol::split_headers_body(b"\nbody\n"),
+        (&b""[..], &b"body\n"[..])
+    );
+    assert_eq!(
+        git_buttress::protocol::split_headers_body(b"tree 0000000000000000000000000000000000000000   \n"),
+        (&b"tree 0000000000000000000000000000000000000000   "[..], &b""[..])
+    );
+
+    // 2. Duplicate `tree ` header in commit MUST fail closed as Mismatch (not last-wins!)
+    let dup_tree = b"tree 1111111111111111111111111111111111111111\ntree 2222222222222222222222222222222222222222\n\nmsg\n";
+    let err = git_buttress::protocol::parse_commit([0xaa; 20], dup_tree.to_vec()).unwrap_err();
+    assert_eq!(err.kind, VerifyErrorKind::Mismatch);
+
+    // 3. Tree parser: overflow octal (>7 digits), empty name, and `/` in entry name MUST be rejected
+    let mut bad_octal = b"777777777777777 f\0".to_vec();
+    bad_octal.extend_from_slice(&[0x11; 20]);
+    assert!(git_buttress::protocol::parse_tree_entries(&bad_octal).is_err());
+
+    let mut empty_name = b"100644 \0".to_vec();
+    empty_name.extend_from_slice(&[0x11; 20]);
+    assert!(git_buttress::protocol::parse_tree_entries(&empty_name).is_err());
+
+    let mut slash_name = b"100644 a/b\0".to_vec();
+    slash_name.extend_from_slice(&[0x11; 20]);
+    assert!(git_buttress::protocol::parse_tree_entries(&slash_name).is_err());
+
+    // 4. Duplicate `+blake3-` segment in ref name MUST be rejected; `^{}` peel suffix MUST work
+    let d_hex = "0b0663e8d56ab3231c8e4bde914f42429b08f1edb19a237ef496eb1a3316c55c";
+    let bad_ref = format!("refs/tags/v1+blake3-{d_hex}+blake3-acf91ceb6e37c08b51530bf4cc86ae17daaf716f9f2284a1e0ce94c7001a68cd");
+    assert!(git_buttress::protocol::parse_ref_embedded_b3(&bad_ref).is_err());
+    let peeled_ref = format!("refs/tags/v1+blake3-{d_hex}^{{}}");
+    assert_eq!(
+        to_hex(&git_buttress::protocol::parse_ref_embedded_b3(&peeled_ref).unwrap().unwrap()),
+        d_hex
+    );
+
+    // 5. Cyclic tree and cyclic annotated-tag chain MUST terminate with Mismatch (no infinite loop!)
+    struct MapStore {
+        objs: HashMap<Oid, (ObjKind, Vec<u8>)>,
+        shallow: HashSet<Oid>,
+    }
+    impl ObjectStore for MapStore {
+        fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, String> {
+            Ok(self.objs.get(oid).cloned())
+        }
+        fn shallow_commits(&self) -> &HashSet<Oid> {
+            &self.shallow
+        }
+    }
+
+    let t_oid = [0x44u8; 20];
+    let mut cyc_tree = b"40000 loop\0".to_vec();
+    cyc_tree.extend_from_slice(&t_oid);
+    let mut store = MapStore {
+        objs: HashMap::from([(t_oid, (ObjKind::Tree, cyc_tree))]),
+        shallow: HashSet::new(),
+    };
+    let err = verify_target(&mut store, &keys, t_oid, None, None, true).unwrap_err();
+    assert_eq!(err.kind, VerifyErrorKind::Mismatch);
+    assert!(err.message.contains("cycle"));
+
+    // Cyclic tag A -> B -> A and tag `type` mismatch
+    let tag_a = [0x55u8; 20];
+    let tag_b = [0x66u8; 20];
+    let tag_a_raw = format!("object {}\ntype tag\ntag a\n\nm\n", to_hex(&tag_b)).into_bytes();
+    let tag_b_raw = format!("object {}\ntype tag\ntag b\n\nm\n", to_hex(&tag_a)).into_bytes();
+    store.objs.insert(tag_a, (ObjKind::Tag, tag_a_raw));
+    store.objs.insert(tag_b, (ObjKind::Tag, tag_b_raw));
+    let err = verify_target(&mut store, &keys, tag_a, None, None, true).unwrap_err();
+    assert_eq!(err.kind, VerifyErrorKind::Mismatch);
+    assert!(err.message.contains("cycle"));
+
+    let blob_oid = [0x77u8; 20];
+    store.objs.insert(blob_oid, (ObjKind::Blob, b"hi".to_vec()));
+    let lying_tag = [0x88u8; 20];
+    let lying_raw = format!("object {}\ntype commit\ntag lie\n\nm\n", to_hex(&blob_oid)).into_bytes();
+    store.objs.insert(lying_tag, (ObjKind::Tag, lying_raw));
+    let err = verify_target(&mut store, &keys, lying_tag, None, None, true).unwrap_err();
+    assert_eq!(err.kind, VerifyErrorKind::Mismatch);
+    assert!(err.message.contains("declared target type"));
+
+    // 6. DigestCache torn-record repair: corrupting `.git/buttress-cache.bin` with 17 trailing junk
+    //    bytes MUST be truncated back to a 53-byte boundary before appending new entries!
+    let sb = TempSandbox::new();
+    let gd = sb.root.join("cache-test");
+    fs::create_dir_all(&gd).unwrap();
+    let oid1 = [0x01u8; 20];
+    let dig1 = [0xaa; 32];
+    let oid2 = [0x02u8; 20];
+    let dig2 = [0xbb; 32];
+    {
+        let mut c = git_buttress::cache::DigestCache::load_from_git_dir(&gd);
+        c.put_blob(oid1, dig1);
+        c.flush();
+    }
+    // Simulate a torn crash mid-record by appending 17 garbage bytes
+    {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(gd.join("buttress-cache.bin"))
+            .unwrap();
+        f.write_all(&[0xffu8; 17]).unwrap();
+    }
+    {
+        let mut c = git_buttress::cache::DigestCache::load_from_git_dir(&gd);
+        assert_eq!(c.blobs.get(&oid1), Some(&dig1));
+        c.put_tree(oid2, dig2);
+        c.flush();
+    }
+    {
+        let c = git_buttress::cache::DigestCache::load_from_git_dir(&gd);
+        assert_eq!(c.blobs.get(&oid1), Some(&dig1));
+        assert_eq!(c.trees.get(&oid2), Some(&dig2), "post-crash record must stay 53-byte aligned!");
+    }
+
+    // 7. POSIX shell quoting with hostile characters (`$`, `'`, spaces, backticks) & `git tag -f`
+    let hostile_home = sb.root.join("hostile 'home' $(touch PWNED) `id`");
+    let hostile_bin = hostile_home.join(".local/bin");
+    fs::create_dir_all(&hostile_bin).unwrap();
+    let repo_dir = sb.root.join("tagf-repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    assert!(
+        Command::new(&sb.real_git)
+            .env("HOME", &hostile_home)
+            .args(["config", "--global", "user.name", "M"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&sb.real_git)
+            .env("HOME", &hostile_home)
+            .args(["config", "--global", "user.email", "m@e"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let en = Command::new(&sb.buttress_bin)
+        .current_dir(&repo_dir)
+        .env("HOME", &hostile_home)
+        .args(["enable", "--global"])
+        .output()
+        .unwrap();
+    assert!(en.status.success(), "enable in hostile HOME failed: {:?}", en);
+
+    let h_git = hostile_bin.join("git");
+    let h_path = format!("{}:{}", hostile_bin.display(), env::var("PATH").unwrap_or_default());
+    assert!(
+        Command::new(&h_git)
+            .current_dir(&repo_dir)
+            .env("HOME", &hostile_home)
+            .env("PATH", &h_path)
+            .args(["init", "-b", "main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(repo_dir.join("x"), "1\n").unwrap();
+    assert!(
+        Command::new(&h_git)
+            .current_dir(&repo_dir)
+            .env("HOME", &hostile_home)
+            .env("PATH", &h_path)
+            .args(["add", "x"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&h_git)
+            .current_dir(&repo_dir)
+            .env("HOME", &hostile_home)
+            .env("PATH", &h_path)
+            .args(["commit", "-m", "c1"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        !sb.root.join("PWNED").exists() && !repo_dir.join("PWNED").exists(),
+        "shell metacharacters in HOME must never execute!"
+    );
+
+    // Test `git tag v1` then `git tag -f v1` on a new commit mints updated companion tag!
+    assert!(
+        Command::new(&h_git)
+            .current_dir(&repo_dir)
+            .env("HOME", &hostile_home)
+            .env("PATH", &h_path)
+            .args(["tag", "v1"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(repo_dir.join("x"), "2\n").unwrap();
+    assert!(
+        Command::new(&h_git)
+            .current_dir(&repo_dir)
+            .env("HOME", &hostile_home)
+            .env("PATH", &h_path)
+            .args(["commit", "-am", "c2"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&h_git)
+            .current_dir(&repo_dir)
+            .env("HOME", &hostile_home)
+            .env("PATH", &h_path)
+            .args(["tag", "-f", "v1"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let head_b3 = String::from_utf8_lossy(
+        &Command::new(&sb.buttress_bin)
+            .current_dir(&repo_dir)
+            .args(["id", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let tags_after = String::from_utf8_lossy(
+        &Command::new(&h_git)
+            .current_dir(&repo_dir)
+            .env("HOME", &hostile_home)
+            .env("PATH", &h_path)
+            .args(["tag", "-l"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .to_string();
+    assert!(
+        tags_after.contains(&format!("v1+blake3-{head_b3}")),
+        "git tag -f must mint companion tag for new commit: {tags_after}"
+    );
+}

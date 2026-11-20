@@ -1,12 +1,22 @@
 //! Safe, hardened Git subprocess interface.
 //!
-//! Security & reliability invariants:
-//!   - Always resolves the REAL `git` binary (skipping our own `~/.local/bin/git`
-//!     wrapper via `GIT_BUTTRESS_REAL_GIT` or scanning `$PATH` past wrapper scripts)
-//!     so we never infinite-loop.
-//!   - Always passes `--no-replace-objects` and sets `GIT_NO_REPLACE_OBJECTS=1`,
-//!     `GIT_NO_LAZY_FETCH=1`, `GIT_OPTIONAL_LOCKS=0` on object reads so `git replace`
-//!     cannot fool verification and partial clones never hang fetching missing blobs.
+//! # Module Contract & Representation Invariants
+//!
+//! - **Meaning of `GitRepo`:** Handle to an existing SHA-1 Git repository rooted at
+//!   `(git_dir, common_dir)` accessed through a verified real `git` binary `real_git`
+//!   (never our own wrapper script), plus its `.git/shallow` boundary set `shallow`
+//!   and an optional persistent `git cat-file --batch` child `batch`.
+//! - **Invariant `I(repo)`:**
+//!   1. `repo.real_git` points to a non-wrapper executable (`!is_our_wrapper(&repo.real_git)`).
+//!   2. The repository's `--show-object-format` was verified to equal `"sha1"` at `open()`.
+//!   3. Every subprocess spawned via `repo.cmd()` or `ensure_batch()` carries
+//!      `--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS=1`, and `GIT_NO_LAZY_FETCH=1`,
+//!      so `refs/replace/*` grafts are ignored and partial clones fail fast as missing
+//!      objects instead of hanging on network fetches.
+//!   4. `repo.batch == Some(b)` iff `b` is at a clean request/response frame boundary
+//!      on `git cat-file --batch` stdout. If any read or parse error ever occurs inside
+//!      `read_object`, `self.batch` is immediately dropped (`None`) so a subsequent call
+//!      cannot read desynchronized bytes from the stream!
 
 use crate::cache::Oid;
 use std::collections::HashSet;
@@ -171,6 +181,12 @@ impl Drop for BatchCatFile {
 }
 
 impl GitRepo {
+    /// Contract:
+    /// - `requires`: `cwd` (or process current directory if `None`) is inside a SHA-1 Git repository or bare repo.
+    /// - `ensures`: on `Ok(r)`, `I(r)` holds (`r.real_git` is not our wrapper, object-format is `"sha1"`,
+    ///   and `r.shallow` contains all valid 40-hex OIDs in `r.common_dir/shallow`).
+    ///   Returns `Err` if outside a Git repo, if `git` is missing, or if `--show-object-format != "sha1"`.
+    /// - `writes`: nothing on disk.
     pub fn open(cwd: Option<&Path>) -> Result<Self, String> {
         let real_git = resolve_real_git()?;
         let cwd = match cwd {
@@ -330,7 +346,29 @@ impl GitRepo {
 }
 
 impl ObjectStore for GitRepo {
+    /// Contract:
+    /// - `requires`: `I(self)`
+    /// - `ensures`: preserves `I(self)` on BOTH `Ok` and `Err` (clearing `self.batch = None` on any stream/parse error).
+    ///   Returns `Ok(Some((kind, raw)))` with the exact uncompressed Git object payload (without `<type> <size>\0`
+    ///   loose header) when `oid` exists locally, `Ok(None)` when `oid` is absent locally, or `Err` on I/O failure.
+    /// - `writes`: `self.batch` (spawns or advances `git cat-file --batch` stream; no repository state modified).
     fn read_object(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, String> {
+        let res = self.read_object_inner(oid);
+        if res.is_err() {
+            // Frame-safety invariant: drop the batch child on ANY stream/parse error so a future
+            // `read_object` call cannot read leftover payload bytes as a header line!
+            self.batch = None;
+        }
+        res
+    }
+
+    fn shallow_commits(&self) -> &HashSet<Oid> {
+        &self.shallow
+    }
+}
+
+impl GitRepo {
+    fn read_object_inner(&mut self, oid: &Oid) -> Result<Option<(ObjKind, Vec<u8>)>, String> {
         let b = self.ensure_batch()?;
         let hex = to_hex(oid);
         b.stdin
@@ -373,10 +411,6 @@ impl ObjectStore for GitRepo {
             return Err("cat-file missing trailing LF".into());
         }
         Ok(Some((kind, payload)))
-    }
-
-    fn shallow_commits(&self) -> &HashSet<Oid> {
-        &self.shallow
     }
 }
 

@@ -1,5 +1,24 @@
 //! Zero-friction setup (`enable` / `disable`), transparent `git` wrapper,
 //! `post-commit` sealing, and `reference-transaction` tag minting + fetch/clone/pull verification.
+//!
+//! # Module Contract & Safety Invariants
+//!
+//! 1. **Shell-injection-free hook & wrapper generation:** All paths interpolated into
+//!    POSIX `#!/bin/sh` scripts (`post-commit`, `reference-transaction`, `~/.local/bin/git`)
+//!    MUST pass through `posix_single_quote()` (`'...'` with `'` -> `'\''`), so paths
+//!    containing spaces, `$`, `` ` ``, `"`, `\`, or `;` never execute unintended shell code.
+//! 2. **Atomic compare-and-swap on `seal_head`:** `seal_head` updates the symbolic target
+//!    of `HEAD` (when on a branch) or `HEAD` with `--no-deref` (when detached), passing
+//!    both `<new_oid>` and `<expected_old_oid>` to `git update-ref` so concurrent ref
+//!    updates fail closed instead of clobbering.
+//! 3. **Fail-closed incoming ref verification (`reference-transaction` `prepared`):**
+//!    Every non-deletion, non-symbolic ref update on `refs/remotes/*`, `refs/tags/*`, or
+//!    any ref containing `"+blake3-"` is verified with `DigestCache::memory_only()` before
+//!    Git commits the ref transaction. Any `Mismatch` returns `Err` (exit 1), causing Git
+//!    to abort the ref transaction cleanly.
+//! 4. **Tag companion minting (`committed` phase):** Companion `refs/tags/<name>+blake3-<dig>`
+//!    is minted on both tag creation (`old == 0`) and forced tag update (`git tag -f`),
+//!    peeling annotated tag chains with cycle detection, and never firing on remote fetches.
 
 use crate::cache::{Dig, DigestCache, Oid};
 use crate::git::{GitRepo, ObjKind, ObjectStore, WRAPPER_MARKER, hex_to_oid, resolve_real_git, to_hex};
@@ -256,18 +275,25 @@ pub fn seal_head(repo: &mut GitRepo, force_sign: bool, quiet: bool) -> Result<(O
         .to_string();
     let reflog = format!("commit (buttress): {subj}");
 
-    // Atomic compare-and-swap on HEAD
+    // Atomic compare-and-swap on the exact target ref (branch ref if symbolic, else `--no-deref HEAD`)
+    let sym_target = repo
+        .cmd()
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let mut cmd = repo.cmd();
     cmd.env("GIT_BUTTRESS_INTERNAL", "1");
+    cmd.args(["update-ref", "-m", &reflog]);
+    if let Some(ref target_ref) = sym_target {
+        cmd.args([target_ref.as_str(), &to_hex(&new_oid), &to_hex(&head_oid)]);
+    } else {
+        cmd.args(["--no-deref", "HEAD", &to_hex(&new_oid), &to_hex(&head_oid)]);
+    }
     let out = cmd
-        .args([
-            "update-ref",
-            "-m",
-            &reflog,
-            "HEAD",
-            &to_hex(&new_oid),
-            &to_hex(&head_oid),
-        ])
         .output()
         .map_err(|e| format!("git update-ref: {e}"))?;
     if !out.status.success() {
@@ -442,8 +468,8 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
     }
 
     let keys = ContextKeys::new();
-    for (old_s, new_s, refname) in &updates {
-        if old_s != zero || new_s == zero || new_s.starts_with("ref:") {
+    for (_old_s, new_s, refname) in &updates {
+        if new_s == zero || new_s.starts_with("ref:") {
             continue;
         }
         let Some(tag_name) = refname.strip_prefix("refs/tags/") else {
@@ -455,9 +481,11 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
         let Ok(oid) = hex_to_oid(new_s.as_bytes()) else {
             continue;
         };
-        // Compute the target object's BLAKE3 digest (peeling annotated tags to the tagged commit/object)
+        // Compute the target object's BLAKE3 digest (peeling annotated tags with cycle guard)
         let target_dig = {
             let mut cur_oid = oid;
+            let mut seen_tags = std::collections::HashSet::new();
+            seen_tags.insert(cur_oid);
             loop {
                 let Some((kind, raw)) = repo.read_object(&cur_oid)? else {
                     return Ok(());
@@ -465,6 +493,9 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
                 if kind == ObjKind::Tag {
                     let (next_oid, _, _) =
                         crate::protocol::parse_annotated_tag(&raw).map_err(|e| e.message)?;
+                    if !seen_tags.insert(next_oid) {
+                        return Err(format!("buttress: cyclic tag chain at {}", to_hex(&next_oid)));
+                    }
                     cur_oid = next_oid;
                 } else {
                     let cache = DigestCache::load_from_git_dir(&repo.common_dir);
@@ -487,7 +518,7 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
         };
 
         let companion = format!("refs/tags/{tag_name}+blake3-{}", to_hex(&target_dig));
-        if repo.try_rev_parse(&companion).is_some() {
+        if repo.try_rev_parse(&companion) == Some(oid) {
             continue;
         }
         let mut cmd = repo.cmd();
@@ -520,26 +551,44 @@ pub fn run_git_wrapper(args: &[String]) -> i32 {
     };
 
     // Parse leading global git options (`-C <dir>`, `-c k=v`, `--git-dir=...`, etc.)
-    let (subcmd_idx, work_dir) = find_git_subcommand(args);
+    let (subcmd_idx, work_dir, git_dir_ovr, cfg_overrides) = find_git_subcommand(args);
     let subcmd = subcmd_idx.map(|i| args[i].as_str());
 
     match subcmd {
-        Some("commit") => wrap_git_commit(&real_git, args, subcmd_idx.unwrap(), work_dir.as_deref()),
-        Some("fsck") => wrap_git_fsck(&real_git, args, work_dir.as_deref()),
+        Some("commit") => wrap_git_commit(
+            &real_git,
+            args,
+            subcmd_idx.unwrap(),
+            work_dir.as_deref(),
+            git_dir_ovr.as_deref(),
+            &cfg_overrides,
+        ),
+        Some("fsck") => wrap_git_fsck(
+            &real_git,
+            args,
+            work_dir.as_deref(),
+            git_dir_ovr.as_deref(),
+            &cfg_overrides,
+        ),
         _ => exec_or_spawn(&real_git, args),
     }
 }
 
-fn find_git_subcommand(args: &[String]) -> (Option<usize>, Option<PathBuf>) {
+/// Parse leading global `git` flags before the subcommand name, tracking `-C <dir>`,
+/// `--git-dir`, and `-c k=v` overrides so wrapper post-actions inspect the exact same
+/// repository and configuration that stock `git` operated on!
+fn find_git_subcommand(args: &[String]) -> (Option<usize>, Option<PathBuf>, Option<PathBuf>, Vec<String>) {
     let mut i = 0;
     let mut cwd: Option<PathBuf> = None;
+    let mut git_dir_override: Option<PathBuf> = None;
+    let mut config_overrides: Vec<String> = Vec::new();
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
-            return (None, cwd);
+            return (None, cwd, git_dir_override, config_overrides);
         }
         if !a.starts_with('-') {
-            return (Some(i), cwd);
+            return (Some(i), cwd, git_dir_override, config_overrides);
         }
         if a == "-C" {
             if i + 1 < args.len() {
@@ -561,16 +610,38 @@ fn find_git_subcommand(args: &[String]) -> (Option<usize>, Option<PathBuf>) {
                 i += 1;
                 continue;
             }
+        } else if a == "-c" {
+            if i + 1 < args.len() {
+                config_overrides.push(args[i + 1].clone());
+                i += 2;
+                continue;
+            }
+        } else if let Some(rest) = a.strip_prefix("-c") {
+            if !rest.is_empty() {
+                config_overrides.push(rest.to_string());
+                i += 1;
+                continue;
+            }
+        } else if a == "--git-dir" {
+            if i + 1 < args.len() {
+                git_dir_override = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+                continue;
+            }
+        } else if let Some(rest) = a.strip_prefix("--git-dir=") {
+            git_dir_override = Some(PathBuf::from(rest));
+            i += 1;
+            continue;
         } else if matches!(
             a,
-            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" | "--config-env"
+            "--work-tree" | "--namespace" | "--super-prefix" | "--config-env"
         ) {
             i += 2;
             continue;
         }
         i += 1;
     }
-    (None, cwd)
+    (None, cwd, git_dir_override, config_overrides)
 }
 
 fn commit_args_suppress_or_preview(commit_args: &[String]) -> (bool, bool) {
@@ -640,25 +711,59 @@ fn commit_args_suppress_or_preview(commit_args: &[String]) -> (bool, bool) {
     (user_quiet, false)
 }
 
+fn has_cli_disabled(cfg_overrides: &[String]) -> Option<bool> {
+    let mut res: Option<bool> = None;
+    for kv in cfg_overrides {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("buttress.disabled") {
+                let v = v.trim();
+                res = Some(matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "on" | "1"
+                ));
+            }
+        } else if kv.trim().eq_ignore_ascii_case("buttress.disabled") {
+            // In Git `-c section.key` without `=` means boolean `true`
+            res = Some(true);
+        }
+    }
+    res
+}
+
+fn resolve_target_repo(work_dir: Option<&Path>, git_dir_ovr: Option<&Path>) -> Option<GitRepo> {
+    if let Some(gd) = git_dir_ovr {
+        let base = work_dir
+            .map(PathBuf::from)
+            .or_else(|| env::current_dir().ok())?;
+        let full_gd = if gd.is_absolute() {
+            gd.to_path_buf()
+        } else {
+            base.join(gd)
+        };
+        GitRepo::open(Some(&full_gd)).ok()
+    } else {
+        let d = work_dir
+            .map(PathBuf::from)
+            .or_else(|| env::current_dir().ok())?;
+        GitRepo::open(Some(&d)).ok()
+    }
+}
+
 fn wrap_git_commit(
     real_git: &Path,
     args: &[String],
     subcmd_idx: usize,
     work_dir: Option<&Path>,
+    git_dir_ovr: Option<&Path>,
+    cfg_overrides: &[String],
 ) -> i32 {
     let commit_args = &args[subcmd_idx + 1..];
     let (user_quiet, skip_intercept) = commit_args_suppress_or_preview(commit_args);
-    if skip_intercept || user_quiet {
+    if skip_intercept || user_quiet || has_cli_disabled(cfg_overrides) == Some(true) {
         return exec_or_spawn(real_git, args);
     }
 
-    let effective_cwd = work_dir
-        .map(PathBuf::from)
-        .or_else(|| env::current_dir().ok());
-    let old_head = effective_cwd
-        .as_deref()
-        .and_then(|d| GitRepo::open(Some(d)).ok())
-        .and_then(|r| r.try_rev_parse("HEAD"));
+    let old_head = resolve_target_repo(work_dir, git_dir_ovr).and_then(|r| r.try_rev_parse("HEAD"));
 
     // Inject `-q` right after `commit` so stock Git doesn't print the pre-seal short SHA!
     let mut patched = Vec::with_capacity(args.len() + 1);
@@ -683,13 +788,13 @@ fn wrap_git_commit(
 
     // Ensure HEAD is sealed (covers repos using local hooks that didn't call our global post-commit)
     // and print the exact Git commit summary with the true sealed SHA!
-    if let Some(ref d) = effective_cwd {
-        if let Ok(mut repo) = GitRepo::open(Some(d)) {
-            if !repo.config_bool("buttress.disabled", false) {
-                let _ = seal_head(&mut repo, false, true);
-            }
-            print_commit_summary(&repo, old_head.is_none());
+    if let Some(mut repo) = resolve_target_repo(work_dir, git_dir_ovr) {
+        let disabled = has_cli_disabled(cfg_overrides)
+            .unwrap_or_else(|| repo.config_bool("buttress.disabled", false));
+        if !disabled {
+            let _ = seal_head(&mut repo, false, true);
         }
+        print_commit_summary(&repo, old_head.is_none());
     }
     0
 }
@@ -741,7 +846,13 @@ fn print_commit_summary(repo: &GitRepo, was_unborn: bool) {
     }
 }
 
-fn wrap_git_fsck(real_git: &Path, args: &[String], work_dir: Option<&Path>) -> i32 {
+fn wrap_git_fsck(
+    real_git: &Path,
+    args: &[String],
+    work_dir: Option<&Path>,
+    git_dir_ovr: Option<&Path>,
+    cfg_overrides: &[String],
+) -> i32 {
     let status = Command::new(real_git)
         .args(args)
         .env("GIT_BUTTRESS_REAL_GIT", real_git)
@@ -760,16 +871,12 @@ fn wrap_git_fsck(real_git: &Path, args: &[String], work_dir: Option<&Path>) -> i
     if args.iter().any(|a| a == "-h" || a == "--help") {
         return 0;
     }
-    let cwd = work_dir
-        .map(PathBuf::from)
-        .or_else(|| env::current_dir().ok());
-    let Some(d) = cwd else {
+    let Some(mut repo) = resolve_target_repo(work_dir, git_dir_ovr) else {
         return 0;
     };
-    let Ok(mut repo) = GitRepo::open(Some(&d)) else {
-        return 0;
-    };
-    if repo.config_bool("buttress.disabled", false) {
+    let disabled = has_cli_disabled(cfg_overrides)
+        .unwrap_or_else(|| repo.config_bool("buttress.disabled", false));
+    if disabled {
         return 0;
     }
     match fsck_all_refs(&mut repo, None) {
@@ -895,24 +1002,34 @@ pub fn enable_buttress(
     };
     fs::create_dir_all(&hooks_dir).map_err(|e| format!("create hooks dir: {e}"))?;
 
-    // Check if there was a previous core.hooksPath we should chain to
-    let prev_hooks = read_git_config(&real_git, global, "core.hooksPath")
+    // Check if there was a previous core.hooksPath we should chain to (with `--path` tilde expansion!)
+    let prev_hooks = read_git_config_path(&real_git, global, "core.hooksPath")
         .filter(|p| Path::new(p) != hooks_dir);
+
+    let exe_str = self_exe
+        .to_str()
+        .ok_or("git-buttress executable path is not valid UTF-8")?;
+    let real_git_str = real_git
+        .to_str()
+        .ok_or("real git executable path is not valid UTF-8")?;
+    let hooks_dir_str = hooks_dir
+        .to_str()
+        .ok_or("hooks directory path is not valid UTF-8")?;
 
     write_hook_script(
         &hooks_dir.join("post-commit"),
         &format!(
-            "#!/bin/sh\n{chain}\"{exe}\" seal-head --quiet\n",
+            "#!/bin/sh\n{chain}{exe} seal-head --quiet\n",
             chain = chain_snippet(prev_hooks.as_deref(), "post-commit"),
-            exe = self_exe.display()
+            exe = posix_single_quote(exe_str)
         ),
     )?;
     write_hook_script(
         &hooks_dir.join("reference-transaction"),
         &format!(
-            "#!/bin/sh\n{chain}exec \"{exe}\" __hook-reference-transaction \"$@\"\n",
+            "#!/bin/sh\n{chain}exec {exe} __hook-reference-transaction \"$@\"\n",
             chain = chain_snippet_stdin(prev_hooks.as_deref(), "reference-transaction"),
-            exe = self_exe.display()
+            exe = posix_single_quote(exe_str)
         ),
     )?;
 
@@ -923,7 +1040,7 @@ pub fn enable_buttress(
         cfg_cmd.arg("--global");
     }
     let out = cfg_cmd
-        .args(["core.hooksPath", hooks_dir.to_str().unwrap()])
+        .args(["core.hooksPath", hooks_dir_str])
         .output()
         .map_err(|e| format!("git config core.hooksPath: {e}"))?;
     if !out.status.success() {
@@ -959,9 +1076,9 @@ pub fn enable_buttress(
         let git_dest = bin_dir.join("git");
         if !git_dest.exists() || crate::git::is_our_wrapper(&git_dest) {
             let script = format!(
-                "#!/bin/sh\n{WRAPPER_MARKER}\nexport GIT_BUTTRESS_REAL_GIT=\"{real}\"\nexec \"{exe}\" __wrap-git \"$@\"\n",
-                real = real_git.display(),
-                exe = self_exe.display()
+                "#!/bin/sh\n{WRAPPER_MARKER}\nexport GIT_BUTTRESS_REAL_GIT={real}\nexec {exe} __wrap-git \"$@\"\n",
+                real = posix_single_quote(real_git_str),
+                exe = posix_single_quote(exe_str)
             );
             write_hook_script(&git_dest, &script)?;
             installed_wrapper = Some(git_dest);
@@ -1006,13 +1123,35 @@ pub struct EnableReport {
     pub subcmd_path: Option<PathBuf>,
 }
 
-fn read_git_config(real_git: &Path, global: bool, key: &str) -> Option<String> {
+/// Quote an arbitrary string as a literal POSIX `sh` single-quoted token (`'...'` with `'` -> `'\''`).
+///
+/// Contract:
+/// - `requires`: `!s.contains('\0')` (POSIX paths/argv cannot contain NUL).
+/// - `ensures`: POSIX `sh` evaluates the returned token to the exact literal string `s` with zero
+///   parameter expansion, command substitution, word splitting, or globbing.
+/// - `writes`: nothing.
+pub fn posix_single_quote(s: &str) -> String {
+    assert!(!s.contains('\0'), "POSIX shell token cannot contain NUL");
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn read_git_config_path(real_git: &Path, global: bool, key: &str) -> Option<String> {
     let mut c = Command::new(real_git);
     c.arg("config");
     if global {
         c.arg("--global");
     }
-    let out = c.args(["--get", key]).output().ok()?;
+    let out = c.args(["--get", "--path", key]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1021,18 +1160,24 @@ fn read_git_config(real_git: &Path, global: bool, key: &str) -> Option<String> {
 
 fn chain_snippet(prev_dir: Option<&str>, hook_name: &str) -> String {
     match prev_dir {
-        Some(d) => format!(
-            "if [ -x \"{d}/{hook_name}\" ]; then \"{d}/{hook_name}\" \"$@\" || exit $?; fi\n"
-        ),
+        Some(d) => {
+            let hook_path = format!("{}/{hook_name}", d.trim_end_matches('/'));
+            let q = posix_single_quote(&hook_path);
+            format!("if [ -x {q} ]; then {q} \"$@\" || exit $?; fi\n")
+        }
         None => String::new(),
     }
 }
 
 fn chain_snippet_stdin(prev_dir: Option<&str>, hook_name: &str) -> String {
     match prev_dir {
-        Some(d) => format!(
-            "INPUT=$(cat)\nif [ -x \"{d}/{hook_name}\" ]; then printf '%s\\n' \"$INPUT\" | \"{d}/{hook_name}\" \"$@\" || exit $?; fi\nprintf '%s\\n' \"$INPUT\" | "
-        ),
+        Some(d) => {
+            let hook_path = format!("{}/{hook_name}", d.trim_end_matches('/'));
+            let q = posix_single_quote(&hook_path);
+            format!(
+                "INPUT=$(cat)\nif [ -x {q} ]; then printf '%s\\n' \"$INPUT\" | {q} \"$@\" || exit $?; fi\nprintf '%s\\n' \"$INPUT\" | "
+            )
+        }
         None => String::new(),
     }
 }

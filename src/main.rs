@@ -35,7 +35,7 @@ fn main() -> ExitCode {
     match args[0].as_str() {
         "__wrap-git" => {
             let code = run_git_wrapper(&args[1..]);
-            ExitCode::from(code as u8)
+            exit_code_from_status(code)
         }
         "__hook-reference-transaction" => {
             let phase = args.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -48,12 +48,26 @@ fn main() -> ExitCode {
             }
         }
         cmd => match dispatch(cmd, &args[1..]) {
-            Ok(code) => ExitCode::from(code as u8),
+            Ok(code) => exit_code_from_status(code),
             Err(err) => {
                 eprintln!("git-buttress: error: {err}");
                 ExitCode::from(1)
             }
         },
+    }
+}
+
+/// Contract:
+/// - `requires`: true
+/// - `ensures`: returns `ExitCode::SUCCESS` iff `code == 0`; any non-zero `i32` (including `256` or negative)
+///   maps to a non-zero `ExitCode` (never wraps mod 256 to `0`!).
+fn exit_code_from_status(code: i32) -> ExitCode {
+    if code == 0 {
+        ExitCode::SUCCESS
+    } else if (1..=255).contains(&code) {
+        ExitCode::from(code as u8)
+    } else {
+        ExitCode::from(1)
     }
 }
 
@@ -97,6 +111,9 @@ fn cmd_enable(args: &[String]) -> Result<i32, String> {
             other => return Err(format!("unknown option for enable: {other}")),
         }
         i += 1;
+    }
+    if global && local {
+        return Err("cannot pass both --global and --local".into());
     }
     if !global && !local {
         global = true;
@@ -143,6 +160,9 @@ fn cmd_disable(args: &[String]) -> Result<i32, String> {
         }
         i += 1;
     }
+    if global && local {
+        return Err("cannot pass both --global and --local".into());
+    }
     if !global && !local {
         global = true;
     }
@@ -152,10 +172,20 @@ fn cmd_disable(args: &[String]) -> Result<i32, String> {
 }
 
 fn cmd_id(args: &[String]) -> Result<i32, String> {
+    if args.len() > 1 {
+        return Err(format!("unexpected extra argument: {:?}", args[1]));
+    }
+    if let Some(first) = args.first() {
+        if first.starts_with('-') {
+            return Err(format!("unknown option for id: {first}"));
+        }
+    }
     let rev = args.first().map(|s| s.as_str()).unwrap_or("HEAD");
     let mut repo = GitRepo::open(None)?;
     let mut oid = repo.rev_parse(rev)?;
     let keys = ContextKeys::new();
+    let mut seen_tags = std::collections::HashSet::new();
+    seen_tags.insert(oid);
 
     loop {
         let (kind, raw) = repo
@@ -164,6 +194,9 @@ fn cmd_id(args: &[String]) -> Result<i32, String> {
         match kind {
             ObjKind::Tag => {
                 let (next_oid, _, _) = parse_annotated_tag(&raw).map_err(|e| e.message)?;
+                if !seen_tags.insert(next_oid) {
+                    return Err(format!("cycle in annotated tag chain at {}", to_hex(&next_oid)));
+                }
                 oid = next_oid;
             }
             ObjKind::Commit => {
@@ -309,7 +342,7 @@ fn cmd_fsck(args: &[String]) -> Result<i32, String> {
 
 fn cmd_log(args: &[String]) -> Result<i32, String> {
     let mut count = 15usize;
-    let mut rev = "HEAD";
+    let mut rev: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -324,10 +357,19 @@ fn cmd_log(args: &[String]) -> Result<i32, String> {
             s if s.starts_with("-n") => {
                 count = s[2..].parse().map_err(|_| "invalid -n count")?;
             }
-            s => rev = s,
+            s if s.starts_with('-') => {
+                return Err(format!("unknown option for log: {s}"));
+            }
+            s => {
+                if rev.is_some() {
+                    return Err(format!("unexpected extra revision argument for log: {s}"));
+                }
+                rev = Some(s);
+            }
         }
         i += 1;
     }
+    let rev = rev.unwrap_or("HEAD");
 
     let mut repo = GitRepo::open(None)?;
     let out = repo.run(["rev-list", &format!("-n{count}"), rev], None)?;
