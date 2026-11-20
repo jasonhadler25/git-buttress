@@ -6,10 +6,6 @@ spine made of BLAKE3.**
 Old Git carries it without noticing. Anyone with `git-buttress` checks it
 automatically.
 
-> **Status:** Design & specification preview ([`BUTTRESS.md`](BUTTRESS.md)).
-> The terminal sessions below show the target user experience; the earlier
-> prototype in this repository (`git-b3`) is being updated to match.
-
 ---
 
 ## Why? How Git checks your files today
@@ -41,7 +37,8 @@ Maya runs one setup command on her laptop:
 
 ```text
 $ git buttress enable --global
-Configured global Git hooks for git-buttress (commit, tag, fetch, pull, clone).
+Configured global Git hooks for git-buttress at ~/.config/git-buttress/hooks
+Installed transparent `git` wrapper at ~/.local/bin/git
 ```
 
 From that moment on, she never types `git buttress` again. She uses plain `git`
@@ -179,15 +176,43 @@ cleanly to whatever Git ships next.
 
 ---
 
+## Build & Quickstart
+
+```sh
+cargo build --release
+export PATH="$HOME/.local/bin:$PWD/target/release:$PATH"
+git buttress enable --global
+
+# Verify this repository itself:
+git fsck --full --strict
+git buttress log
+```
+
+Run the full integration and adversarial SHA1DC-collision test suite:
+
+```sh
+cargo test --release
+```
+
+---
+
 ## Honest scope & sharp edges
 
-* **One tiny quirk on `git commit`:** Git has no hook that modifies raw commit
-  headers *before* Git prints `[main <short-id>]`, so `post-commit` seals the
-  commit a millisecond afterward, updating its local SHA-1 before you push.
-* **`git fsck` itself isn't hookable in stock Git:** Automatic checking runs on
-  every `git clone`, `git fetch`, and `git pull` (via Git's
-  `reference-transaction` hook); for an on-demand full-repo audit of an
-  already-cloned disk directory, run `git buttress fsck`.
+* **How `git commit` and `git fsck` stay seamless:** `git buttress enable`
+  configures global Git hooks (`post-commit` for commit/rebase/cherry-pick
+  sealing and `reference-transaction` for tag minting and `clone`/`fetch`/`pull`
+  verification) **plus** a tiny transparent `git` wrapper in `~/.local/bin/git`.
+  On `git commit`, the wrapper seals `HEAD` synchronously via atomic
+  `update-ref` compare-and-swap *before* printing `[branch <sha>]`, so there is
+  no race condition and no stale commit ID; on `git fsck`, it runs stock
+  `git fsck` followed automatically by `git buttress fsck`. (GUI tools that
+  bypass `~/.local/bin/git` still seal every commit atomically via
+  `post-commit`; only if you opt out with `--no-wrapper` does stock `git commit`
+  print the pre-seal short SHA before `post-commit` updates `HEAD`.)
+* **Configurable policy when BLAKE3 lines are absent:** Mixed teams work out of
+  the box because `buttress.missing` defaults to `silent` (mismatch is *always*
+  a hard error). Set `git config --global buttress.missing warn` or `error` when
+  you want unbuttressed refs flagged or rejected.
 * **Not magic without a prior foothold:** If you clone from a dishonest server
   for the very first time using only a plain branch name (`main`), with no
   `+blake3-...` tag and no prior local clone, that server can hand you any
@@ -199,13 +224,15 @@ cleanly to whatever Git ships next.
 
 ## Repository Contents
 
-* [`BUTTRESS.md`](BUTTRESS.md) — Draft specification of `git-buttress` (wire
-  headers, BLAKE3 context-string derivations, verification rules, safety
-  argument, test vectors, and full Linux-kernel benchmark numbers: **1 min 18 s**
-  for all 1.5M commits / 141 GB of files).
+* [`src/`](src/) & [`Cargo.toml`](Cargo.toml) — Rust implementation of
+  `git-buttress` built on [`blake3-servil`](https://github.com/servil-software-factory/BLAKE3).
+* [`tests/integration.rs`](tests/integration.rs) — End-to-end tests of the
+  Maya/Dana/Sam workflow, SSH signing, `rebase`/`amend`, shallow boundaries, and
+  simulated SHA1DC collision/second-preimage attacks.
+* [`BUTTRESS.md`](BUTTRESS.md) — Specification of `git-buttress` (wire headers,
+  BLAKE3 context-string derivations, verification rules, safety argument, test
+  vectors, and full Linux-kernel benchmark numbers: **1 min 18 s** for all 1.5M
+  commits / 141 GB of files).
 * [`buttress-vectors.py`](buttress-vectors.py) — 60-line standalone reference
   script computing every digest in `BUTTRESS.md` using only stock `git` and
   `b3sum`.
-* [`git-b3`](git-b3), [`SPEC.md`](SPEC.md), [`test_git_b3.py`](test_git_b3.py)
-  — Working v0.1 prototype and adversarial test suite from the earlier design
-  iteration.

@@ -239,14 +239,25 @@ and a collection shaped like Git's objects, 0.18 ns per byte for
 blake3-servil on one thread and 1.11 ns per byte for SHA-1 with collision
 detection, the kind of SHA-1 Git uses.
 
-## 10. Not decided yet
+## 10. Tag Naming & Configuration Conventions
 
-* The final context strings.
-* Whether and how tags, tag names and branch names carry digests.
-* A line in the commit message that survives a forge's squash or rebase
-  merge.
-* The construction for a `sha256` line.
-* The tool's commands and the name of the "no evidence" setting.
-* The prototype (`git-b3` 0.1.0) still implements the previous draft: other
-  line names, a label prefix where this draft uses context strings, and a
-  length field in the plain-commit rule.
+* **Self-verifying tag names (`+blake3-<64-hex>`):** When `git-buttress` is
+  enabled (and `buttress.autotag` is not `false`), creating a tag `refs/tags/X`
+  also creates `refs/tags/X+blake3-<digest>`, where `<digest>` is the 64-hex
+  digest of the tagged object (for an annotated tag, the target commit/tree/blob
+  it points to). Any reader checking or fetching a ref containing
+  `+blake3-<64-hex>` treats `<64-hex>` as the expected digest of the target.
+* **Annotated tag trailer:** Annotated tags MAY also carry
+  `Buttress-Object: blake3 <target-sha1> <64-hex>` in the tag body prior to any
+  signature block.
+* **"No evidence" configuration (`buttress.missing`):** Controls reader behavior
+  when checking a plain commit with no expected digest: `silent` (default, exit
+  0), `warn` (stderr warning, exit 0), or `error` (stderr error, exit 2).
+
+## 11. Open Items for Future Versions
+
+* Finalizing context strings prior to a `1.0` freeze.
+* Branch-name public-key pinning and forge squash/rebase commit-message
+  trailers.
+* Defining a construction for `sha256` lines if needed by SHA-256-only
+  environments.

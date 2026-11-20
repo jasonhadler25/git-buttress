@@ -1,0 +1,18 @@
+[package]
+name = "git-buttress"
+version = "0.2.0"
+edition = "2024"
+description = "Install once, keep typing plain git: smuggle BLAKE3 Merkle integrity into standard Git commits and tags"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jasonhadler25/git-buttress"
+
+[[bin]]
+name = "git-buttress"
+path = "src/main.rs"
+
+[dependencies]
+blake3-servil = { git = "https://github.com/servil-software-factory/BLAKE3", rev = "2c60420c2bccbf6073e35e668691d98520f9b096", version = "=0.9.1" }
+
+[profile.release]
+opt-level = 3
+strip = "symbols"
