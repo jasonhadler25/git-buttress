@@ -13,6 +13,12 @@ path = "src/main.rs"
 [dependencies]
 blake3-servil = { git = "https://github.com/servil-software-factory/BLAKE3", rev = "2c60420c2bccbf6073e35e668691d98520f9b096", version = "=0.9.1" }
 
+[package.metadata.buttress.git-deps.blake3-servil]
+# Guerilla BLAKE3 pins for our unchecksummed Git dependency (verified in CI without upstream opt-in):
+rev = "2c60420c2bccbf6073e35e668691d98520f9b096"
+tree_blake3 = "113ae02a8b6f05eeb69a88c05a962fc265f22e0530065b3d15c3d2faf78d8123"
+commit_blake3 = "f6483e7945684897eb68725cbe25f7c3589fb4c60cdb24d440b867a971e30be9"
+
 [profile.release]
 opt-level = 3
 strip = "symbols"

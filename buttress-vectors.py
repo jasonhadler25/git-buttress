@@ -108,6 +108,10 @@ def commit_digest(oid):
 if __name__ == "__main__":
     fmt = git("rev-parse", "--show-object-format").decode().strip()
     if fmt != "sha1": raise SystemExit(f"unsupported object format: {fmt}")
+    if len(sys.argv) == 3 and sys.argv[1] == "--tree":
+        t = git("rev-parse", "--verify", "--end-of-options", sys.argv[2] + "^{tree}").decode().strip()
+        print("tree           ", t, dir_digest(t).hex())
+        raise SystemExit(0)
     c = git("rev-parse", "--verify", "--end-of-options", sys.argv[1] + "^{commit}").decode().strip()
     raw = read_typed("commit", c)
     tree, parents, sealed = parse_commit_links(raw)
