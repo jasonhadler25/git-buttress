@@ -34,6 +34,9 @@ jobs:
           echo "Actual   blake3-servil tree: $ACTUAL"
           test -n "$EXPECTED" && test "$ACTUAL" = "$EXPECTED"
 
+      - name: Check every fetched crate against the hashset smuggled into Cargo.lock
+        run: python3 ./cargo-lock-hashsets.py
+
       - name: Run Rust unit & integration test suite
         run: cargo test --release --locked
 

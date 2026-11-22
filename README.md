@@ -243,6 +243,10 @@ cargo test --release
   BLAKE3 context-string derivations, verification rules, safety argument, test
   vectors, and full Linux-kernel benchmark numbers: **1 min 18 s** for all 1.5M
   commits / 141 GB of files).
+* [`cargo-lock-hashsets.py`](cargo-lock-hashsets.py) — writes and checks a
+  [hashset](https://github.com/jasonhadler25/hashset) (BLAKE3 and SHA-256) for
+  each crate in `Cargo.lock`, stored in `Cargo.lock`'s own `[metadata]` table,
+  which Cargo carries along and ignores. CI checks them before building.
 * [`buttress-vectors.py`](buttress-vectors.py) — 60-line standalone reference
   script computing every digest in `BUTTRESS.md` using only stock `git` and
   `b3sum`.
