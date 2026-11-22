@@ -201,18 +201,19 @@ cargo test --release
 
 ## Honest scope & sharp edges
 
-* **How `git commit` and `git fsck` stay seamless:** `git buttress enable`
-  configures global Git hooks (`post-commit` for commit/rebase/cherry-pick
-  sealing and `reference-transaction` for `clone`/`fetch`/`pull` verification,
-  forwarding standard Git hooks to any prior `core.hooksPath` or `.git/hooks/`)
-  **plus** a tiny transparent `git` wrapper in `~/.local/bin/git`. On
-  `git commit`, `post-commit` rewrites the new local commit with BLAKE3 headers
-  via `git update-ref` compare-and-swap (preserving explicit `-S<key>` signing
-  keys and verifying ancestor seals before signing) while the wrapper holds `-q`
-  so terminal output prints only the final `[branch <sealed-sha>]` summary; on
-  `git fsck`, it runs stock `git fsck` followed automatically by
-  `git buttress fsck`. (`refs/replace/*` grafts are ignored during verification;
-  do not rely on `refs/replace` when consuming verified repositories.)
+* **How `git commit` and `git fsck` stay seamless:** On Git 2.56+,
+  `git buttress enable` registers native config-based hooks (`[hook "buttress-*"]`)
+  without touching `core.hooksPath` at all—so `git-lfs`, `pre-commit`, `husky`,
+  and repository `.git/hooks/` work natively side-by-side (on older Git, it falls
+  back to reversible `core.hooksPath` forwarding). It also installs a tiny
+  transparent `git` wrapper in `~/.local/bin/git`. On `git commit`, `post-commit`
+  rewrites the new local commit with BLAKE3 headers via `git update-ref`
+  compare-and-swap (preserving explicit `-S<key>` signing keys and verifying
+  ancestor seals before signing) while the wrapper holds `-q` so terminal output
+  prints only the final `[branch <sealed-sha>]` summary; on `git fsck`, it runs
+  stock `git fsck` followed automatically by `git buttress fsck`.
+  (`refs/replace/*` grafts are ignored during verification; do not rely on
+  `refs/replace` when consuming verified repositories.)
 * **Configurable policy when BLAKE3 lines are absent:** Mixed teams work out of
   the box because `buttress.missing` defaults to `silent` (mismatch is *always*
   a hard error). Set `git config --global buttress.missing warn` or `error` when

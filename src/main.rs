@@ -131,10 +131,16 @@ fn cmd_enable(args: &[String]) -> Result<i32, String> {
     }
     let rep = enable_buttress(global, bin_dir, no_wrapper)?;
     let scope = if global { "global" } else { "repository" };
-    println!(
-        "Configured {scope} Git hooks for git-buttress at {}",
-        rep.hooks_dir.display()
-    );
+    if rep.native_hooks {
+        println!(
+            "Configured {scope} native Git hooks (`hook.buttress-*`; `core.hooksPath` untouched)"
+        );
+    } else if let Some(ref hd) = rep.hooks_dir {
+        println!(
+            "Configured {scope} Git hooks for git-buttress at {}",
+            hd.display()
+        );
+    }
     if let Some(ref wp) = rep.wrapper_path {
         let dir = wp.parent().unwrap_or(Path::new(""));
         println!("Installed transparent `git` wrapper at {}", wp.display());
@@ -189,10 +195,10 @@ fn cmd_id(args: &[String]) -> Result<i32, String> {
     if args.len() > 1 {
         return Err(format!("unexpected extra argument: {:?}", args[1]));
     }
-    if let Some(first) = args.first() {
-        if first.starts_with('-') {
-            return Err(format!("unknown option for id: {first}"));
-        }
+    if let Some(first) = args.first()
+        && first.starts_with('-')
+    {
+        return Err(format!("unknown option for id: {first}"));
     }
     let rev = args.first().map(|s| s.as_str()).unwrap_or("HEAD");
     let mut repo = GitRepo::open(None)?;

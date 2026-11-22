@@ -969,7 +969,7 @@ fn mutation_survivor_killing_suite() {
 
     // Wrong field count in blake3 tag trailer (2 fields or 4 fields)
     for bad_fields in [
-        format!("{target_hex}"),
+        target_hex.to_string(),
         format!("{target_hex} {good_hex} extra"),
     ] {
         let bad_tag =
@@ -1399,7 +1399,8 @@ fn astra_audit_round1_regressions() {
     }
 
     // --- H10: Install -> repeat install -> disable preserves & restores prior `core.hooksPath`
-    //          AND chains `.git/hooks/pre-commit`! (Astra's `install_lifecycle.py`!) ---
+    //          AND chains `.git/hooks/pre-commit`! Tests BOTH native Git 2.56+ `[hook "buttress-*"]`
+    //          AND legacy `core.hooksPath` fallback! ---
     let prior_hooks = sb.root.join("prior-hooks");
     fs::create_dir_all(&prior_hooks).unwrap();
     assert!(
@@ -1410,16 +1411,58 @@ fn astra_audit_round1_regressions() {
             .unwrap()
             .success()
     );
-    assert!(sb.run_buttress(&sb.root, &["enable", "--global", "--no-wrapper"]).status.success());
+    // 1. Test legacy `core.hooksPath` fallback explicitly via env toggle
+    assert!(
+        Command::new(&sb.buttress_bin)
+            .current_dir(&sb.root)
+            .env("HOME", &sb.home)
+            .env("GIT_BUTTRESS_REAL_GIT", &sb.real_git)
+            .env("GIT_BUTTRESS_FORCE_LEGACY_HOOKSPATH", "1")
+            .args(["enable", "--global", "--no-wrapper"])
+            .status()
+            .unwrap()
+            .success()
+    );
     // Repeat install MUST NOT clobber saved `prior-hooks`!
-    assert!(sb.run_buttress(&sb.root, &["enable", "--global", "--no-wrapper"]).status.success());
+    assert!(
+        Command::new(&sb.buttress_bin)
+            .current_dir(&sb.root)
+            .env("HOME", &sb.home)
+            .env("GIT_BUTTRESS_REAL_GIT", &sb.real_git)
+            .env("GIT_BUTTRESS_FORCE_LEGACY_HOOKSPATH", "1")
+            .args(["enable", "--global", "--no-wrapper"])
+            .status()
+            .unwrap()
+            .success()
+    );
     let hooks_path = sb.home.join(".config/git-buttress/hooks");
     let pc_script = fs::read_to_string(hooks_path.join("post-commit")).unwrap();
     assert!(
         pc_script.contains(prior_hooks.to_str().unwrap()),
         "H10: repeat enable must preserve prior core.hooksPath in chained dispatcher!"
     );
-    // Disable MUST restore `prior-hooks` and clean up generated scripts!
+    // 2. Now run default `enable --global` (which on Git 2.56+ migrates cleanly to native `[hook]`
+    //    AND restores `core.hooksPath` back to `prior_hooks`!) followed by `disable`!
+    assert!(sb.run_buttress(&sb.root, &["enable", "--global", "--no-wrapper"]).status.success());
+    if git_buttress::hooks::supports_native_config_hooks(&sb.real_git) {
+        let cur_hp = String::from_utf8_lossy(
+            &Command::new(&sb.real_git)
+                .env("HOME", &sb.home)
+                .args(["config", "--global", "--get", "--path", "core.hooksPath"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(
+            fs::canonicalize(&cur_hp).unwrap(),
+            fs::canonicalize(&prior_hooks).unwrap(),
+            "Native Git 2.56+ enable must migrate off legacy core.hooksPath and leave prior core.hooksPath untouched!"
+        );
+        assert!(!hooks_path.join("post-commit").exists());
+    }
+    // Disable MUST leave `prior-hooks` intact and clean up generated scripts!
     assert!(sb.run_buttress(&sb.root, &["disable", "--global"]).status.success());
     let restored = String::from_utf8_lossy(
         &Command::new(&sb.real_git)

@@ -23,6 +23,12 @@ pub struct ContextKeys {
     pub plain: ContextKey,
 }
 
+impl Default for ContextKeys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContextKeys {
     pub fn new() -> Self {
         blake3_servil::initialize();
@@ -339,9 +345,12 @@ pub fn parse_commit(oid: Oid, raw: Vec<u8>) -> Result<ParsedCommit, VerifyError>
     })
 }
 
+/// One parsed entry from a raw Git tree object: `(mode_bytes, octal_mode, name_bytes, child_oid)`.
+pub type TreeEntry<'a> = (&'a [u8], u32, &'a [u8], Oid);
+
 /// Parse raw Git tree entries: `(mode_bytes, octal_mode, name_bytes, child_oid)`.
 /// Enforces unique entry names (no duplicates, `.`, `..`, `.git`, empty, or `/`).
-pub fn parse_tree_entries(raw: &[u8]) -> Result<Vec<(&[u8], u32, &[u8], Oid)>, VerifyError> {
+pub fn parse_tree_entries(raw: &[u8]) -> Result<Vec<TreeEntry<'_>>, VerifyError> {
     let mut entries = Vec::new();
     let mut seen_names: HashSet<&[u8]> = HashSet::new();
     let mut i = 0;
@@ -925,14 +934,14 @@ pub fn verify_target_with_engine<S: ObjectStore>(
         Some(r) => parse_ref_embedded_b3(r)?,
         None => None,
     };
-    if let (Some(a), Some(b)) = (explicit_expect, ref_expect) {
-        if !ct_eq(&a, &b) {
-            return Err(VerifyError::mismatch(format!(
-                "--expect ({}) disagrees with ref name digest ({})",
-                to_hex(&a),
-                to_hex(&b)
-            )));
-        }
+    if let (Some(a), Some(b)) = (explicit_expect, ref_expect)
+        && !ct_eq(&a, &b)
+    {
+        return Err(VerifyError::mismatch(format!(
+            "--expect ({}) disagrees with ref name digest ({})",
+            to_hex(&a),
+            to_hex(&b)
+        )));
     }
     let mut expect = explicit_expect.or(ref_expect);
 
@@ -965,14 +974,14 @@ pub fn verify_target_with_engine<S: ObjectStore>(
                     "Buttress-Object trailer on a tag-to-tag object is ambiguous; attach trailer to the tag naming the non-tag target",
                 ));
             }
-            if let (Some(exp), Some(td)) = (expect, trailer_dig) {
-                if !ct_eq(&exp, &td) {
-                    return Err(VerifyError::mismatch(format!(
-                        "tag Buttress-Object ({}) disagrees with expected digest ({})",
-                        to_hex(&td),
-                        to_hex(&exp)
-                    )));
-                }
+            if let (Some(exp), Some(td)) = (expect, trailer_dig)
+                && !ct_eq(&exp, &td)
+            {
+                return Err(VerifyError::mismatch(format!(
+                    "tag Buttress-Object ({}) disagrees with expected digest ({})",
+                    to_hex(&td),
+                    to_hex(&exp)
+                )));
             }
             if expect.is_none() {
                 expect = trailer_dig;
@@ -1076,15 +1085,15 @@ pub fn verify_target_with_engine<S: ObjectStore>(
 
             let (root_dig, initial_sealed) = engine.digest_commit(target_oid)?;
 
-            if let Some(exp) = expect {
-                if !ct_eq(&root_dig, &exp) {
-                    return Err(VerifyError::mismatch(format!(
-                        "MISMATCH on commit {}:\n  expected: {}\n  actual:   {}",
-                        to_hex(&target_oid),
-                        to_hex(&exp),
-                        to_hex(&root_dig)
-                    )));
-                }
+            if let Some(exp) = expect
+                && !ct_eq(&root_dig, &exp)
+            {
+                return Err(VerifyError::mismatch(format!(
+                    "MISMATCH on commit {}:\n  expected: {}\n  actual:   {}",
+                    to_hex(&target_oid),
+                    to_hex(&exp),
+                    to_hex(&root_dig)
+                )));
             }
 
             // CRITICAL (H2 fix): Walk and verify ALL reachable sealed ancestors EVEN when `root_pc`

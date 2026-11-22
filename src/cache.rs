@@ -175,11 +175,11 @@ impl DigestCache {
             return;
         }
         // Refuse to follow symlinks on cache path
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if !meta.file_type().is_file() {
-                self.pending.clear();
-                return;
-            }
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && !meta.file_type().is_file()
+        {
+            self.pending.clear();
+            return;
         }
 
         let mut opts = OpenOptions::new();

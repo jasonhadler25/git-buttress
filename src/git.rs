@@ -342,14 +342,13 @@ impl GitRepo {
             c.stdin(Stdio::piped());
         }
         let mut child = c.spawn().map_err(|e| format!("spawn git: {e}"))?;
-        if let Some(bytes) = input {
-            if let Some(mut stdin) = child.stdin.take() {
-                if let Err(e) = stdin.write_all(bytes) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("write git stdin: {e}"));
-                }
-            }
+        if let Some(bytes) = input
+            && let Some(mut stdin) = child.stdin.take()
+            && let Err(e) = stdin.write_all(bytes)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("write git stdin: {e}"));
         }
         let out = child.wait_with_output().map_err(|e| format!("wait git: {e}"))?;
         if !out.status.success() {

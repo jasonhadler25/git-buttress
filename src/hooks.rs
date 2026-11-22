@@ -212,10 +212,10 @@ fn format_gpgsig_header(sig: &[u8]) -> Vec<u8> {
 }
 
 fn expand_tilde(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Ok(home) = env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     PathBuf::from(s)
 }
@@ -338,17 +338,17 @@ pub fn seal_head_with_key(
     if want_sign && !head_pc.parents.is_empty() {
         let mut anc_eng = Engine::new_verifier(repo, &keys);
         for &p in &head_pc.parents {
-            if let Err(e) = verify_target_with_engine(&mut anc_eng, p, None, None, true) {
-                if matches!(
+            if let Err(e) = verify_target_with_engine(&mut anc_eng, p, None, None, true)
+                && matches!(
                     e.kind,
                     VerifyErrorKind::Mismatch | VerifyErrorKind::StoreFailure
-                ) {
-                    return Err(format!(
-                        "refusing to sign HEAD: parent {} failed BLAKE3 ancestry verification: {}",
-                        to_hex(&p),
-                        e.message
-                    ));
-                }
+                )
+            {
+                return Err(format!(
+                    "refusing to sign HEAD: parent {} failed BLAKE3 ancestry verification: {}",
+                    to_hex(&p),
+                    e.message
+                ));
             }
         }
     }
@@ -509,10 +509,13 @@ pub fn seal_head_with_key(
     Ok((new_oid, sealed_dig))
 }
 
+/// One parsed record from Git `reference-transaction` stdin: `(old_token, new_token, refname)`.
+type RefUpdate = (Vec<u8>, Vec<u8>, Vec<u8>);
+
 /// Strictly parse Git `reference-transaction` stdin at the byte level (`H1` fix):
 /// Every line MUST be `<old-token> <new-token> <refname>\n` separated by single ASCII `0x20` spaces.
 /// Propagates I/O errors and rejects malformed lines instead of silently truncating!
-fn parse_transaction_stdin(mut reader: impl Read) -> Result<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>, String> {
+fn parse_transaction_stdin(mut reader: impl Read) -> Result<Vec<RefUpdate>, String> {
     let mut raw = Vec::new();
     reader
         .read_to_end(&mut raw)
@@ -547,7 +550,7 @@ fn parse_transaction_stdin(mut reader: impl Read) -> Result<Vec<(Vec<u8>, Vec<u8
 
 /// Check if an incoming single-ref transaction matches an exact scoped internal token
 /// (`seal-head:<old>:<new>` or `autotag:<ref>:<new>`) rather than a blanket env-var bypass (`H1` fix).
-fn is_scoped_internal_tx(updates: &[(Vec<u8>, Vec<u8>, Vec<u8>)]) -> bool {
+fn is_scoped_internal_tx(updates: &[RefUpdate]) -> bool {
     let Ok(tok) = env::var("GIT_BUTTRESS_INTERNAL_TX") else {
         return false;
     };
@@ -555,14 +558,15 @@ fn is_scoped_internal_tx(updates: &[(Vec<u8>, Vec<u8>, Vec<u8>)]) -> bool {
         return false;
     }
     let (old_b, new_b, ref_b) = &updates[0];
-    if let Some(rest) = tok.strip_prefix("seal-head:") {
-        if let Some((exp_old, exp_new)) = rest.split_once(':') {
-            return old_b == exp_old.as_bytes() && new_b == exp_new.as_bytes();
-        }
-    } else if let Some(rest) = tok.strip_prefix("autotag:") {
-        if let Some((exp_ref, exp_new)) = rest.rsplit_once(':') {
-            return ref_b == exp_ref.as_bytes() && new_b == exp_new.as_bytes();
-        }
+    if let Some(rest) = tok.strip_prefix("seal-head:")
+        && let Some((exp_old, exp_new)) = rest.split_once(':')
+    {
+        return old_b == exp_old.as_bytes() && new_b == exp_new.as_bytes();
+    }
+    if let Some(rest) = tok.strip_prefix("autotag:")
+        && let Some((exp_ref, exp_new)) = rest.rsplit_once(':')
+    {
+        return ref_b == exp_ref.as_bytes() && new_b == exp_new.as_bytes();
     }
     false
 }
@@ -602,17 +606,15 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
         // iff `refs/tags/<X>+blake3-<hex>` with the SAME `<new-oid>` is in this transaction (`M3` fix)!
         let mut paired_plain_tags: HashSet<(Vec<u8>, Vec<u8>)> = HashSet::new();
         for (_, new_b, ref_b) in &updates {
-            if let Ok(ref_s) = std::str::from_utf8(ref_b) {
-                if let Some(rest) = ref_s.strip_prefix("refs/tags/") {
-                    if let Some((base_tag, _)) = rest.split_once("+blake3-") {
-                        if parse_ref_embedded_b3(ref_s).ok().flatten().is_some() {
-                            paired_plain_tags.insert((
-                                format!("refs/tags/{base_tag}").into_bytes(),
-                                new_b.clone(),
-                            ));
-                        }
-                    }
-                }
+            if let Ok(ref_s) = std::str::from_utf8(ref_b)
+                && let Some(rest) = ref_s.strip_prefix("refs/tags/")
+                && let Some((base_tag, _)) = rest.split_once("+blake3-")
+                && parse_ref_embedded_b3(ref_s).ok().flatten().is_some()
+            {
+                paired_plain_tags.insert((
+                    format!("refs/tags/{base_tag}").into_bytes(),
+                    new_b.clone(),
+                ));
             }
         }
 
@@ -909,19 +911,19 @@ fn split_git_global_args(args: &[OsString]) -> (Option<usize>, Vec<OsString>, Ve
         ) {
             global.push(a.clone());
             if i + 1 < args.len() {
-                if s == "-c" {
-                    if let Some(kv) = args[i + 1].to_str() {
-                        cfg_overrides.push(kv.to_string());
-                    }
+                if s == "-c"
+                    && let Some(kv) = args[i + 1].to_str()
+                {
+                    cfg_overrides.push(kv.to_string());
                 }
                 global.push(args[i + 1].clone());
                 i += 2;
                 continue;
             }
-        } else if let Some(rest) = s.strip_prefix("-c") {
-            if !rest.is_empty() {
-                cfg_overrides.push(rest.to_string());
-            }
+        } else if let Some(rest) = s.strip_prefix("-c")
+            && !rest.is_empty()
+        {
+            cfg_overrides.push(rest.to_string());
         }
         global.push(a.clone());
         i += 1;
@@ -949,10 +951,10 @@ fn has_cli_disabled(cfg_overrides: &[String]) -> Option<bool> {
 fn cli_missing_override(cfg_overrides: &[String]) -> Option<String> {
     let mut res = None;
     for kv in cfg_overrides {
-        if let Some((k, v)) = kv.split_once('=') {
-            if k.trim().eq_ignore_ascii_case("buttress.missing") {
-                res = Some(v.trim().to_string());
-            }
+        if let Some((k, v)) = kv.split_once('=')
+            && k.trim().eq_ignore_ascii_case("buttress.missing")
+        {
+            res = Some(v.trim().to_string());
         }
     }
     res
@@ -1377,14 +1379,12 @@ pub fn fsck_all_refs(
     // Exact companion tag pairing (`refs/tags/<X>` paired only with `refs/tags/<X>+blake3-...` at same OID)
     let mut paired_plain_tags: HashSet<(Vec<u8>, Oid)> = HashSet::new();
     for (oid, ref_b) in &refs {
-        if let Ok(ref_s) = std::str::from_utf8(ref_b) {
-            if let Some(rest) = ref_s.strip_prefix("refs/tags/") {
-                if let Some((base_tag, _)) = rest.split_once("+blake3-") {
-                    if parse_ref_embedded_b3(ref_s).ok().flatten().is_some() {
-                        paired_plain_tags.insert((format!("refs/tags/{base_tag}").into_bytes(), *oid));
-                    }
-                }
-            }
+        if let Ok(ref_s) = std::str::from_utf8(ref_b)
+            && let Some(rest) = ref_s.strip_prefix("refs/tags/")
+            && let Some((base_tag, _)) = rest.split_once("+blake3-")
+            && parse_ref_embedded_b3(ref_s).ok().flatten().is_some()
+        {
+            paired_plain_tags.insert((format!("refs/tags/{base_tag}").into_bytes(), *oid));
         }
     }
 
@@ -1491,7 +1491,79 @@ const FORWARDED_GIT_HOOKS: &[&str] = &[
     "post-index-change",
 ];
 
-/// Install hooks + reversible state manifest (`prev-hooks-path`) + atomic script writes (`H10` fix).
+/// Detect whether the installed Git supports native config-based multi-hooks (`git hook list` /
+/// `[hook "<name>"]`, Git 2.56+), which lets `git-buttress` integrate cleanly WITHOUT touching
+/// `core.hooksPath` (eliminating conflicts with `git-lfs`, `pre-commit`, `husky`, etc.)!
+pub fn supports_native_config_hooks(real_git: &Path) -> bool {
+    let Ok(out) = Command::new(real_git).args(["hook", "list", "-h"]).output() else {
+        return false;
+    };
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    combined.contains("usage: git hook list")
+}
+
+fn cleanup_legacy_hooks_dir(real_git: &Path, global: bool, hooks_dir: &Path) -> Result<(), String> {
+    let canonical_hooks_dir = fs::canonicalize(hooks_dir).unwrap_or_else(|_| hooks_dir.to_path_buf());
+    let state_file = hooks_dir.join(".buttress-prev-hooks-path");
+    let current_cfg = read_git_config_path(real_git, Some(global), "core.hooksPath");
+    let points_to_ours = current_cfg
+        .as_ref()
+        .map(|p| {
+            let cp = fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+            cp == canonical_hooks_dir
+        })
+        .unwrap_or(false);
+
+    if points_to_ours {
+        let prev = fs::read_to_string(&state_file)
+            .ok()
+            .map(|s| s.trim_end_matches('\n').to_string())
+            .filter(|s| !s.is_empty());
+        let mut cmd = Command::new(real_git);
+        cmd.arg("config");
+        if global {
+            cmd.arg("--global");
+        } else {
+            cmd.arg("--local");
+        }
+        match prev {
+            Some(ref p) => {
+                let out = cmd
+                    .args(["core.hooksPath", p])
+                    .output()
+                    .map_err(|e| format!("restore core.hooksPath: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "failed restoring prior core.hooksPath: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+            }
+            None => {
+                let _ = cmd.args(["--unset", "core.hooksPath"]).output();
+            }
+        }
+    }
+
+    if hooks_dir.is_dir() {
+        for &h in FORWARDED_GIT_HOOKS {
+            let _ = fs::remove_file(hooks_dir.join(h));
+        }
+        let _ = fs::remove_file(&state_file);
+        let _ = fs::remove_dir(hooks_dir);
+    }
+    Ok(())
+}
+
+/// Install hooks cleanly:
+/// - On Git 2.56+ (`git hook list`), configures native `[hook "buttress-*"]` entries WITHOUT
+///   touching `core.hooksPath` (so `git-lfs`, `pre-commit`, `husky`, and repo `.git/hooks/*`
+///   work natively side-by-side!). Migrates cleanly off any older `git-buttress` `core.hooksPath`.
+/// - On older Git, installs reversible `core.hooksPath` forwarding stubs with saved prior state.
 pub fn enable_buttress(
     global: bool,
     wrapper_dir: Option<&Path>,
@@ -1509,52 +1581,6 @@ pub fn enable_buttress(
         let repo = GitRepo::open(None)?;
         repo.common_dir().join("buttress-hooks")
     };
-    fs::create_dir_all(&hooks_dir).map_err(|e| format!("create hooks dir: {e}"))?;
-    let canonical_hooks_dir = fs::canonicalize(&hooks_dir).unwrap_or_else(|_| hooks_dir.clone());
-
-    let state_file = hooks_dir.join(".buttress-prev-hooks-path");
-    let current_cfg_hooks = read_git_config_path(&real_git, Some(global), "core.hooksPath");
-    let is_already_ours = current_cfg_hooks
-        .as_ref()
-        .map(|p| {
-            let cp = fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
-            cp == canonical_hooks_dir
-        })
-        .unwrap_or(false);
-
-    // Preserve the user's prior scoped `core.hooksPath` for exact restore on `disable`, AND
-    // for `--local` also inspect the effective inherited (global/system) `core.hooksPath` so
-    // local enable doesn't silently drop a pre-existing global hooks path (`R2-H5` fix)!
-    let saved_prev_hooks: Option<String> = if is_already_ours {
-        fs::read_to_string(&state_file)
-            .ok()
-            .map(|s| s.trim_end_matches('\n').to_string())
-            .filter(|s| !s.is_empty())
-    } else {
-        let p = current_cfg_hooks;
-        write_atomic_regular(
-            &state_file,
-            p.as_deref().unwrap_or("").as_bytes(),
-            0o644,
-        )?;
-        p
-    };
-
-    let global_buttress_hooks = env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".config").join("git-buttress").join("hooks"))
-        .map(|p| fs::canonicalize(&p).unwrap_or(p));
-    let forward_prev_hooks: Option<String> = if saved_prev_hooks.is_some() || global {
-        saved_prev_hooks
-    } else {
-        // Local enable with no prior local `core.hooksPath`: check inherited effective `core.hooksPath`
-        // (excluding our own global buttress hooks dir to avoid duplicate sealing).
-        read_git_config_path(&real_git, None, "core.hooksPath").filter(|p| {
-            let cp = fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
-            cp != canonical_hooks_dir && global_buttress_hooks.as_ref() != Some(&cp)
-        })
-    };
-    let prev_hooks = forward_prev_hooks;
 
     let exe_str = self_exe
         .to_str()
@@ -1562,66 +1588,147 @@ pub fn enable_buttress(
     let real_git_str = real_git
         .to_str()
         .ok_or("real git executable path is not valid UTF-8")?;
-    let hooks_dir_str = hooks_dir
-        .to_str()
-        .ok_or("hooks directory path is not valid UTF-8")?;
 
-    // Write forwarding stubs for safe standard Git hooks (excluding `push-to-checkout` & `proc-receive`!).
-    for &hook_name in FORWARDED_GIT_HOOKS {
-        let script = match hook_name {
-            "post-commit" => format!(
-                "#!/bin/sh\n{fwd}{exe} seal-head --quiet\n",
-                fwd = forward_hook_no_stdin(
-                    prev_hooks.as_deref(),
-                    hook_name,
-                    real_git_str,
-                    &canonical_hooks_dir
-                ),
-                exe = posix_single_quote(exe_str),
-            ),
-            "reference-transaction" => format!(
-                "#!/bin/sh\n{fwd}",
-                fwd = forward_reference_transaction(
-                    prev_hooks.as_deref(),
-                    real_git_str,
-                    exe_str,
-                    &canonical_hooks_dir
-                ),
-            ),
-            other => format!(
-                "#!/bin/sh\n{fwd}exit 0\n",
-                fwd = forward_hook_passthrough_stdin(
-                    prev_hooks.as_deref(),
-                    other,
-                    real_git_str,
-                    &canonical_hooks_dir
-                ),
-            ),
-        };
-        write_atomic_regular(&hooks_dir.join(hook_name), script.as_bytes(), 0o755)?;
-    }
+    let use_native = supports_native_config_hooks(&real_git)
+        && env::var_os("GIT_BUTTRESS_FORCE_LEGACY_HOOKSPATH").is_none();
 
-    // Configure core.hooksPath
-    let mut cfg_cmd = Command::new(&real_git);
-    cfg_cmd.arg("config");
-    if global {
-        cfg_cmd.arg("--global");
+    let report_hooks_dir = if use_native {
+        // Migrate cleanly off any legacy `core.hooksPath` directory we previously installed.
+        cleanup_legacy_hooks_dir(&real_git, global, &hooks_dir)?;
+
+        let scope_flag = if global { "--global" } else { "--local" };
+        let exe_q = posix_single_quote(exe_str);
+        let pc_cmd = format!("{exe_q} seal-head --quiet");
+        let tx_cmd = format!("{exe_q} __hook-reference-transaction");
+
+        if !global {
+            let _ = Command::new(&real_git)
+                .args(["config", "--local", "buttress.disabled", "false"])
+                .output();
+        }
+        for (key, val, replace_all) in [
+            ("hook.buttress-post-commit.event", "post-commit", true),
+            ("hook.buttress-post-commit.command", pc_cmd.as_str(), false),
+            ("hook.buttress-post-commit.enabled", "true", false),
+            ("hook.buttress-reference-transaction.event", "reference-transaction", true),
+            ("hook.buttress-reference-transaction.command", tx_cmd.as_str(), false),
+            ("hook.buttress-reference-transaction.enabled", "true", false),
+        ] {
+            let mut c = Command::new(&real_git);
+            c.args(["config", scope_flag]);
+            if replace_all {
+                c.arg("--replace-all");
+            }
+            let out = c
+                .args([key, val])
+                .output()
+                .map_err(|e| format!("git config {key}: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "git config {key} failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        None
     } else {
-        cfg_cmd.args(["--local", "buttress.disabled", "false"]);
-        let _ = cfg_cmd.output();
-        cfg_cmd = Command::new(&real_git);
-        cfg_cmd.args(["config", "--local"]);
-    }
-    let out = cfg_cmd
-        .args(["core.hooksPath", hooks_dir_str])
-        .output()
-        .map_err(|e| format!("git config core.hooksPath: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git config failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
+        fs::create_dir_all(&hooks_dir).map_err(|e| format!("create hooks dir: {e}"))?;
+        let canonical_hooks_dir = fs::canonicalize(&hooks_dir).unwrap_or_else(|_| hooks_dir.clone());
+
+        let state_file = hooks_dir.join(".buttress-prev-hooks-path");
+        let current_cfg_hooks = read_git_config_path(&real_git, Some(global), "core.hooksPath");
+        let is_already_ours = current_cfg_hooks
+            .as_ref()
+            .map(|p| {
+                let cp = fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+                cp == canonical_hooks_dir
+            })
+            .unwrap_or(false);
+
+        let saved_prev_hooks: Option<String> = if is_already_ours {
+            fs::read_to_string(&state_file)
+                .ok()
+                .map(|s| s.trim_end_matches('\n').to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            let p = current_cfg_hooks;
+            write_atomic_regular(&state_file, p.as_deref().unwrap_or("").as_bytes(), 0o644)?;
+            p
+        };
+
+        let global_buttress_hooks = env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".config").join("git-buttress").join("hooks"))
+            .map(|p| fs::canonicalize(&p).unwrap_or(p));
+        let prev_hooks: Option<String> = if saved_prev_hooks.is_some() || global {
+            saved_prev_hooks
+        } else {
+            read_git_config_path(&real_git, None, "core.hooksPath").filter(|p| {
+                let cp = fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+                cp != canonical_hooks_dir && global_buttress_hooks.as_ref() != Some(&cp)
+            })
+        };
+
+        let hooks_dir_str = hooks_dir
+            .to_str()
+            .ok_or("hooks directory path is not valid UTF-8")?;
+
+        for &hook_name in FORWARDED_GIT_HOOKS {
+            let script = match hook_name {
+                "post-commit" => format!(
+                    "#!/bin/sh\n{fwd}{exe} seal-head --quiet\n",
+                    fwd = forward_hook_no_stdin(
+                        prev_hooks.as_deref(),
+                        hook_name,
+                        real_git_str,
+                        &canonical_hooks_dir
+                    ),
+                    exe = posix_single_quote(exe_str),
+                ),
+                "reference-transaction" => format!(
+                    "#!/bin/sh\n{fwd}",
+                    fwd = forward_reference_transaction(
+                        prev_hooks.as_deref(),
+                        real_git_str,
+                        exe_str,
+                        &canonical_hooks_dir
+                    ),
+                ),
+                other => format!(
+                    "#!/bin/sh\n{fwd}exit 0\n",
+                    fwd = forward_hook_passthrough_stdin(
+                        prev_hooks.as_deref(),
+                        other,
+                        real_git_str,
+                        &canonical_hooks_dir
+                    ),
+                ),
+            };
+            write_atomic_regular(&hooks_dir.join(hook_name), script.as_bytes(), 0o755)?;
+        }
+
+        let mut cfg_cmd = Command::new(&real_git);
+        cfg_cmd.arg("config");
+        if global {
+            cfg_cmd.arg("--global");
+        } else {
+            cfg_cmd.args(["--local", "buttress.disabled", "false"]);
+            let _ = cfg_cmd.output();
+            cfg_cmd = Command::new(&real_git);
+            cfg_cmd.args(["config", "--local"]);
+        }
+        let out = cfg_cmd
+            .args(["core.hooksPath", hooks_dir_str])
+            .output()
+            .map_err(|e| format!("git config core.hooksPath: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git config failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Some(hooks_dir)
+    };
 
     let mut installed_wrapper: Option<PathBuf> = None;
     let mut installed_subcmd: Option<PathBuf> = None;
@@ -1664,14 +1771,16 @@ pub fn enable_buttress(
     }
 
     Ok(EnableReport {
-        hooks_dir,
+        hooks_dir: report_hooks_dir,
+        native_hooks: use_native,
         wrapper_path: installed_wrapper,
         subcmd_path: installed_subcmd,
     })
 }
 
 /// Reversibly disable `git-buttress` (`H10` fix):
-/// - Restores the saved prior `core.hooksPath` (if `core.hooksPath` currently points to our `hooks_dir`),
+/// - Removes native `[hook "buttress-*"]` config sections (and disables global native hooks locally).
+/// - Restores any saved prior `core.hooksPath` (if `core.hooksPath` currently points to our `hooks_dir`),
 ///   never clobbering an unrelated `core.hooksPath`.
 /// - For `--local`, sets `buttress.disabled = true` so a global wrapper/hook also respects local disable!
 /// - Removes generated hook scripts and our `git` wrapper script cleanly.
@@ -1684,63 +1793,32 @@ pub fn disable_buttress(global: bool, wrapper_dir: Option<&Path>) -> Result<(), 
         let repo = GitRepo::open(None)?;
         repo.common_dir().join("buttress-hooks")
     };
-    let canonical_hooks_dir = fs::canonicalize(&hooks_dir).unwrap_or_else(|_| hooks_dir.clone());
-    let state_file = hooks_dir.join(".buttress-prev-hooks-path");
 
-    let current_cfg = read_git_config_path(&real_git, Some(global), "core.hooksPath");
-    let points_to_ours = current_cfg
-        .as_ref()
-        .map(|p| {
-            let cp = fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
-            cp == canonical_hooks_dir
-        })
-        .unwrap_or(false);
-
-    if points_to_ours {
-        let prev = fs::read_to_string(&state_file)
-            .ok()
-            .map(|s| s.trim_end_matches('\n').to_string())
-            .filter(|s| !s.is_empty());
-        let mut cmd = Command::new(&real_git);
-        cmd.arg("config");
-        if global {
-            cmd.arg("--global");
-        } else {
-            cmd.arg("--local");
-        }
-        match prev {
-            Some(ref p) => {
-                let out = cmd
-                    .args(["core.hooksPath", p])
-                    .output()
-                    .map_err(|e| format!("restore core.hooksPath: {e}"))?;
-                if !out.status.success() {
-                    return Err(format!(
-                        "failed restoring prior core.hooksPath: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ));
-                }
-            }
-            None => {
-                let _ = cmd.args(["--unset", "core.hooksPath"]).output();
-            }
-        }
-    }
-
-    if !global {
-        // Set local `buttress.disabled = true` so a global `git` wrapper / global hook also stays hands-off!
+    let scope_flag = if global { "--global" } else { "--local" };
+    for section in [
+        "hook.buttress-post-commit",
+        "hook.buttress-reference-transaction",
+    ] {
         let _ = Command::new(&real_git)
-            .args(["config", "--local", "buttress.disabled", "true"])
+            .args(["config", scope_flag, "--remove-section", section])
             .output();
     }
 
-    // Remove generated hook scripts
-    if hooks_dir.is_dir() {
-        for &h in FORWARDED_GIT_HOOKS {
-            let _ = fs::remove_file(hooks_dir.join(h));
+    cleanup_legacy_hooks_dir(&real_git, global, &hooks_dir)?;
+
+    if !global {
+        // Set local `buttress.disabled = true` AND disable global native hooks in this repo!
+        let _ = Command::new(&real_git)
+            .args(["config", "--local", "buttress.disabled", "true"])
+            .output();
+        for key in [
+            "hook.buttress-post-commit.enabled",
+            "hook.buttress-reference-transaction.enabled",
+        ] {
+            let _ = Command::new(&real_git)
+                .args(["config", "--local", key, "false"])
+                .output();
         }
-        let _ = fs::remove_file(&state_file);
-        let _ = fs::remove_dir(&hooks_dir);
     }
 
     if global || wrapper_dir.is_some() {
@@ -1752,18 +1830,20 @@ pub fn disable_buttress(global: bool, wrapper_dir: Option<&Path>) -> Result<(), 
             }
         };
         let git_dest = bin_dir.join("git");
-        if let Ok(meta) = fs::symlink_metadata(&git_dest) {
-            if meta.file_type().is_file() && is_our_wrapper(&git_dest) {
-                fs::remove_file(&git_dest)
-                    .map_err(|e| format!("remove {}: {e}", git_dest.display()))?;
-            }
+        if let Ok(meta) = fs::symlink_metadata(&git_dest)
+            && meta.file_type().is_file()
+            && is_our_wrapper(&git_dest)
+        {
+            fs::remove_file(&git_dest)
+                .map_err(|e| format!("remove {}: {e}", git_dest.display()))?;
         }
     }
     Ok(())
 }
 
 pub struct EnableReport {
-    pub hooks_dir: PathBuf,
+    pub hooks_dir: Option<PathBuf>,
+    pub native_hooks: bool,
     pub wrapper_path: Option<PathBuf>,
     pub subcmd_path: Option<PathBuf>,
 }
