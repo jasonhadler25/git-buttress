@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install b3sum
+        run: cargo install --locked b3sum
+
+      - name: Run Rust unit & integration test suite
+        run: cargo test --release --locked
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Cross-check Rust implementation against standalone Python/b3sum oracle
+        run: |
+          cargo build --release --locked
+          RUST_ID=$(./target/release/git-buttress id HEAD)
+          PY_ID=$(python3 ./buttress-vectors.py HEAD | awk '/^  digest/{print $2}')
+          echo "Rust ID:   $RUST_ID"
+          echo "Python ID: $PY_ID"
+          test "$RUST_ID" = "$PY_ID"
+          ./target/release/git-buttress check HEAD --no-shallow
+          ./target/release/git-buttress fsck

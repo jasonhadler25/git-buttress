@@ -409,6 +409,9 @@ pub struct Engine<'a, S: ObjectStore> {
     /// so `digest_commit` returns identical `(digest, frontier)` whether cold or warm!
     plain_frontiers: OidMap<Vec<Oid>>,
     verified_seals: HashSet<Oid>,
+    /// Sealed commits whose entire reachable ancestry verified with ZERO shallow skips
+    /// on this snapshot, allowing multi-ref `fsck` / `prepared` runs to avoid O(refs * history) re-walks!
+    transitively_verified: HashSet<Oid>,
 }
 
 impl<'a, S: ObjectStore> Engine<'a, S> {
@@ -420,15 +423,18 @@ impl<'a, S: ObjectStore> Engine<'a, S> {
             parsed: OidMap::new(),
             plain_frontiers: OidMap::new(),
             verified_seals: HashSet::new(),
+            transitively_verified: HashSet::new(),
         }
+    }
+
+    /// Construct a verification-only `Engine` guaranteed by construction to use an isolated
+    /// in-memory cache (`TB-1`).
+    pub fn new_verifier(store: &'a mut S, keys: &'a ContextKeys) -> Self {
+        Self::new(store, keys, DigestCache::memory_only())
     }
 
     pub fn flush_cache(&mut self) {
         self.cache.flush();
-    }
-
-    pub fn put_commit_cache(&mut self, oid: Oid, dig: Dig) {
-        self.cache.put_commit(oid, dig);
     }
 
     pub fn parsed_commits(&self) -> &OidMap<ParsedCommit> {
@@ -1099,6 +1105,11 @@ pub fn verify_target_with_engine<S: ObjectStore>(
             let mut shallow_stops = 0usize;
 
             while let Some(cur) = queue.pop_front() {
+                // If `cur` and its ENTIRE reachable ancestry already verified cleanly with zero
+                // shallow skips on this Engine snapshot, skip re-walking its ancestors (`R2-H7` fix)!
+                if engine.transitively_verified.contains(&cur) {
+                    continue;
+                }
                 let already_verified_in_run = engine.verified_seals.contains(&cur);
                 let pc = engine.load_commit(cur)?;
                 let CommitClass::Sealed {
@@ -1133,14 +1144,28 @@ pub fn verify_target_with_engine<S: ObjectStore>(
                             cur_had_shallow_skip = true;
                             continue;
                         }
+                        let pin_note = if expect.is_some() {
+                            " (pinned target requires complete history)"
+                        } else {
+                            ""
+                        };
                         return Err(VerifyError::incomplete(format!(
-                            "commit {} stops at shallow boundary (missing parent {})",
+                            "commit {} stops at shallow boundary (missing parent {}){pin_note}",
                             to_hex(&cur),
                             to_hex(&p_oid)
                         )));
                     }
 
-                    let (actual_p_dig, under_sealed) = engine.digest_commit(p_oid)?;
+                    let (actual_p_dig, under_sealed) = engine.digest_commit(p_oid).map_err(|e| {
+                        if expect.is_some() && e.kind == VerifyErrorKind::Incomplete {
+                            VerifyError::incomplete(format!(
+                                "{} (pinned target requires complete history)",
+                                e.message
+                            ))
+                        } else {
+                            e
+                        }
+                    })?;
                     if !already_verified_in_run && !ct_eq(&actual_p_dig, exp_p_dig) {
                         return Err(VerifyError::mismatch(format!(
                             "MISMATCH at parent {} of commit {}:\n  parent expected: {}\n  parent actual:   {}",
@@ -1165,6 +1190,12 @@ pub fn verify_target_with_engine<S: ObjectStore>(
                 if !cur_had_shallow_skip {
                     engine.verified_seals.insert(cur);
                 }
+            }
+
+            // Every sealed commit in `seen_sealed` now had itself AND all reachable ancestors
+            // verified without error; if `shallow_stops == 0`, their entire closures are complete!
+            if shallow_stops == 0 {
+                engine.transitively_verified.extend(seen_sealed.iter().copied());
             }
 
             if expect.is_none() && !root_is_sealed {

@@ -2,7 +2,7 @@ use git_buttress::cache::DigestCache;
 use git_buttress::git::{GitRepo, ObjKind, ObjectStore, hex_to_32, to_hex};
 use git_buttress::hooks::{
     MissingPolicy, disable_buttress, enable_buttress, fsck_all_refs, run_git_wrapper_os,
-    run_reference_transaction_hook, sanitize_for_tty, seal_head,
+    run_reference_transaction_hook, sanitize_for_tty, seal_head_with_key,
 };
 use git_buttress::protocol::{
     CheckOutcome, CommitClass, ContextKeys, Engine, VerifyError, VerifyErrorKind,
@@ -403,8 +403,16 @@ fn cmd_fsck(args: &[String]) -> Result<i32, String> {
         i += 1;
     }
     let mut repo = GitRepo::open(None)?;
-    let (matched, no_ev) = fsck_all_refs(&mut repo, missing_arg)?;
-    println!("buttress fsck: {matched} ref(s) verified, {no_ev} ref(s) without buttress lines");
+    let (matched, partial, no_ev) = fsck_all_refs(&mut repo, missing_arg)?;
+    if partial > 0 {
+        println!(
+            "buttress fsck: {matched} ref(s) verified, {partial} ref(s) partially verified (shallow), {no_ev} ref(s) without buttress lines"
+        );
+    } else {
+        println!(
+            "buttress fsck: {matched} ref(s) verified, {no_ev} ref(s) without buttress lines"
+        );
+    }
     Ok(0)
 }
 
@@ -486,17 +494,28 @@ fn cmd_log(args: &[String]) -> Result<i32, String> {
 fn cmd_seal_head(args: &[String]) -> Result<i32, String> {
     let mut sign = false;
     let mut quiet = false;
-    for a in args {
-        match a.as_str() {
+    let mut sign_key: Option<String> = env::var("GIT_BUTTRESS_SIGN_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--sign" | "-S" => sign = true,
             "--quiet" | "-q" => quiet = true,
+            "--sign-key" => {
+                i += 1;
+                let k = args.get(i).ok_or("--sign-key requires a key path or ID")?;
+                sign_key = Some(k.clone());
+                sign = true;
+            }
             other => return Err(format!("unknown option for seal-head: {other}")),
         }
+        i += 1;
     }
     let mut repo = GitRepo::open(None)?;
     if repo.config_bool_strict("buttress.disabled", false)? {
         return Ok(0);
     }
-    seal_head(&mut repo, sign, quiet)?;
+    seal_head_with_key(&mut repo, sign, sign_key.as_deref(), quiet)?;
     Ok(0)
 }

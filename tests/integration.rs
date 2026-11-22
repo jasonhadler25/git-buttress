@@ -1662,4 +1662,87 @@ fn astra_audit_round2_regressions() {
         VerifyErrorKind::Incomplete,
         "R2-H2: trailer-pinned tag must fail closed on missing shallow parent!"
     );
+
+    // --- 6. R2-M5: `git commit -m -n` MUST NOT mistake message `-n` for `--no-verify`! ---
+    fs::write(subrepo.join("dash-n.txt"), "message is -n\n").unwrap();
+    assert!(sb.run_user_git(&subrepo, &["add", "dash-n.txt"]).status.success());
+    let dash_n_commit = sb.run_user_git(&subrepo, &["commit", "-m", "-n"]);
+    assert!(dash_n_commit.status.success());
+    let head_raw = String::from_utf8_lossy(
+        &sb.run_stock_git(&subrepo, &["cat-file", "commit", "HEAD"]).stdout,
+    )
+    .to_string();
+    assert!(
+        head_raw.contains("buttress-tree blake3 "),
+        "R2-M5: `git commit -m -n` must still seal HEAD!\n{head_raw}"
+    );
+
+    // --- 7. R2-H4: `git commit -S<explicit-key>` MUST sign with `<explicit-key>`, not `user.signingkey`! ---
+    let key_default = sb.root.join("ssh_key_default");
+    let key_alt = sb.root.join("ssh_key_alt");
+    assert!(
+        Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-N", "", "-f"])
+            .arg(&key_default)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-N", "", "-f"])
+            .arg(&key_alt)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let alt_allowed = sb.root.join("allowed_alt_only");
+    let alt_pub = fs::read_to_string(key_alt.with_extension("pub")).unwrap();
+    fs::write(&alt_allowed, format!("alt@example.com {alt_pub}")).unwrap();
+
+    assert!(sb.run_user_git(&subrepo, &["config", "gpg.format", "ssh"]).status.success());
+    assert!(
+        sb.run_user_git(&subrepo, &["config", "user.signingkey", key_default.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        sb.run_user_git(
+            &subrepo,
+            &["config", "gpg.ssh.allowedSignersFile", alt_allowed.to_str().unwrap()]
+        )
+        .status
+        .success()
+    );
+    fs::write(subrepo.join("signed-alt.txt"), "explicit key\n").unwrap();
+    assert!(sb.run_user_git(&subrepo, &["add", "signed-alt.txt"]).status.success());
+    let alt_sign_flag = format!("-S{}", key_alt.to_str().unwrap());
+    let signed_out = sb.run_user_git(&subrepo, &["commit", &alt_sign_flag, "-m", "Signed with alt key"]);
+    assert!(signed_out.status.success(), "commit -S<alt> failed: {:?}", signed_out);
+    // `git verify-commit HEAD` ONLY trusts `alt_allowed` (key_alt), NOT `key_default`!
+    let verify_alt = sb.run_stock_git(&subrepo, &["verify-commit", "HEAD"]);
+    assert!(
+        verify_alt.status.success(),
+        "R2-H4: sealed commit MUST remain signed by explicit -S<alt-key>, not overwritten with user.signingkey!\nstderr={}",
+        String::from_utf8_lossy(&verify_alt.stderr)
+    );
+
+    // --- 8. R2-H2: `fsck_all_refs` MUST count shallow-stopped refs as `partial`, NOT full `matched`! ---
+    let shallow_clone = sb.root.join("shallow-fsck");
+    let file_url = format!("file://{}", subrepo.display());
+    assert!(
+        sb.run_stock_git(&sb.root, &["clone", "--depth=1", &file_url, shallow_clone.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let mut sh_repo = GitRepo::open(Some(&shallow_clone)).unwrap();
+    let (full_m, partial_m, no_ev_m) =
+        git_buttress::hooks::fsck_all_refs(&mut sh_repo, Some("silent")).unwrap();
+    assert_eq!(full_m, 0, "R2-H2: shallow-truncated refs must NOT be counted as full matches");
+    assert!(
+        partial_m >= 1,
+        "R2-H2: shallow-truncated refs must be counted separately in partial_m (got partial={partial_m}, no_ev={no_ev_m})"
+    );
 }

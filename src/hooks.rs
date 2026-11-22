@@ -81,14 +81,22 @@ impl Drop for PrivateTempDir {
     }
 }
 
-/// Sign a commit or tag payload using the repository's configured SSH or OpenPGP key,
-/// validating non-empty signature armor (`[GNUPG:] SIG_CREATED` for OpenPGP, SSH armor for SSH).
-pub fn sign_payload(repo: &GitRepo, payload: &[u8]) -> Result<Vec<u8>, String> {
+/// Sign a commit or tag payload using `explicit_key` (e.g. from `git commit -S<key>`) or the
+/// repository's configured `user.signingkey`, validating non-empty signature armor
+/// (`[GNUPG:] SIG_CREATED` for OpenPGP, SSH armor for SSH).
+pub fn sign_payload(
+    repo: &GitRepo,
+    payload: &[u8],
+    explicit_key: Option<&str>,
+) -> Result<Vec<u8>, String> {
     let fmt = repo
         .config_get_strict("gpg.format")?
         .unwrap_or_else(|| "openpgp".into())
         .to_ascii_lowercase();
-    let key = repo.config_get_strict("user.signingkey")?;
+    let key = match explicit_key.filter(|k| !k.is_empty()) {
+        Some(k) => Some(k.to_string()),
+        None => repo.config_get_strict("user.signingkey")?,
+    };
 
     if fmt == "ssh" {
         let Some(key_str) = key else {
@@ -254,10 +262,20 @@ fn read_head_state(repo: &GitRepo) -> Result<(Option<Vec<u8>>, Oid), String> {
 /// Seal `HEAD` safely (`H5`, `H6`, `H7` fixes):
 /// - Captures `(sym_ref, head_oid)` up front before hashing/signing.
 /// - Refuses to overwrite a commit whose existing `Sealed` headers contradict the store (`H6`).
-/// - Honors `force_sign` even if `HEAD` was already unsigned-`Sealed` (`H6`).
-/// - Uses `DigestCache::memory_only()` whenever signing (`want_sign`) AND verifies the stored
-///   commit object read back from Git before advancing `HEAD` (`H7`).
+/// - Honors `force_sign` and explicit `-S<key>` even if `HEAD` was already unsigned-`Sealed` (`H6`, `R2-H4`).
+/// - When signing (`want_sign`), uses `Engine::new_verifier` (memory-only) AND verifies all
+///   reachable ancestor seals on every parent BEFORE stamping a cryptographic signature (`R2-H4`).
+/// - Re-reads and verifies the stored commit object from Git before advancing `HEAD` (`H7`).
 pub fn seal_head(repo: &mut GitRepo, force_sign: bool, quiet: bool) -> Result<(Oid, Dig), String> {
+    seal_head_with_key(repo, force_sign, None, quiet)
+}
+
+pub fn seal_head_with_key(
+    repo: &mut GitRepo,
+    force_sign: bool,
+    explicit_sign_key: Option<&str>,
+    quiet: bool,
+) -> Result<(Oid, Dig), String> {
     let (sym_ref, head_oid) = read_head_state(repo)?;
     if env::var_os("GIT_BUTTRESS_INTERNAL_OP").as_deref() == Some(OsStr::new("seal-head")) {
         return Ok((head_oid, [0u8; 32]));
@@ -267,13 +285,13 @@ pub fn seal_head(repo: &mut GitRepo, force_sign: bool, quiet: bool) -> Result<(O
 
     // Peek commit class & signature state from fresh store first
     let head_pc = {
-        let mut fresh_eng = Engine::new(repo, &keys, DigestCache::memory_only());
+        let mut fresh_eng = Engine::new_verifier(repo, &keys);
         fresh_eng
             .load_commit(head_oid)
             .map_err(|e| format!("parse HEAD: {}", e.message))?
     };
 
-    let want_sign = force_sign || head_pc.has_gpgsig;
+    let want_sign = force_sign || explicit_sign_key.is_some() || head_pc.has_gpgsig;
 
     // If `HEAD` already carries `Sealed` lines, verify them against a fresh memory-only Engine FIRST!
     // If they contradict the store, NEVER silently overwrite tampering evidence (`H6` fix)!
@@ -282,7 +300,7 @@ pub fn seal_head(repo: &mut GitRepo, force_sign: bool, quiet: bool) -> Result<(O
         ref expected_parents,
     } = head_pc.class
     {
-        let mut verify_eng = Engine::new(repo, &keys, DigestCache::memory_only());
+        let mut verify_eng = Engine::new_verifier(repo, &keys);
         let actual_tree = verify_eng
             .digest_tree(head_pc.tree)
             .map_err(|e| format!("hash tree: {}", e.message))?;
@@ -304,7 +322,7 @@ pub fn seal_head(repo: &mut GitRepo, force_sign: bool, quiet: bool) -> Result<(O
                 ));
             }
         }
-        if !force_sign || head_pc.has_gpgsig {
+        if !force_sign && explicit_sign_key.is_none() || (head_pc.has_gpgsig && explicit_sign_key.is_none()) {
             let d = keys.hash_sealed_commit(&head_pc.raw);
             if !want_sign {
                 let mut dc = DigestCache::load_from_git_dir(repo.common_dir());
@@ -312,6 +330,26 @@ pub fn seal_head(repo: &mut GitRepo, force_sign: bool, quiet: bool) -> Result<(O
                 dc.flush();
             }
             return Ok((head_oid, d));
+        }
+    }
+
+    // When signing, verify reachable ancestor seals on every parent using a fresh memory-only
+    // verifier BEFORE stamping a cryptographic signature (`R2-H4` fix)!
+    if want_sign && !head_pc.parents.is_empty() {
+        let mut anc_eng = Engine::new_verifier(repo, &keys);
+        for &p in &head_pc.parents {
+            if let Err(e) = verify_target_with_engine(&mut anc_eng, p, None, None, true) {
+                if matches!(
+                    e.kind,
+                    VerifyErrorKind::Mismatch | VerifyErrorKind::StoreFailure
+                ) {
+                    return Err(format!(
+                        "refusing to sign HEAD: parent {} failed BLAKE3 ancestry verification: {}",
+                        to_hex(&p),
+                        e.message
+                    ));
+                }
+            }
         }
     }
 
@@ -362,7 +400,7 @@ pub fn seal_head(repo: &mut GitRepo, force_sign: bool, quiet: bool) -> Result<(O
     };
 
     let final_raw = if want_sign {
-        let sig = sign_payload(repo, &unsigned_payload)?;
+        let sig = sign_payload(repo, &unsigned_payload, explicit_sign_key)?;
         let (h_bytes, b_bytes) = split_headers_body(&unsigned_payload);
         let mut signed = Vec::with_capacity(unsigned_payload.len() + sig.len() + 32);
         signed.extend_from_slice(h_bytes);
@@ -698,7 +736,10 @@ pub fn run_reference_transaction_hook(phase: &str) -> Result<(), String> {
                     kind: VerifyErrorKind::Incomplete,
                     message,
                 }) => {
-                    if has_b3_name || policy == MissingPolicy::Error {
+                    if has_b3_name
+                        || policy == MissingPolicy::Error
+                        || message.contains("pinned target")
+                    {
                         return Err(format!(
                             "buttress: incomplete objects for {}: {message}",
                             sanitize_for_tty(&ref_display)
@@ -917,7 +958,18 @@ fn cli_missing_override(cfg_overrides: &[String]) -> Option<String> {
     res
 }
 
-fn is_preview_or_quiet_commit(commit_args: &[OsString]) -> bool {
+#[derive(Default)]
+struct CommitFlagScan {
+    is_preview_or_quiet: bool,
+    no_verify: bool,
+    explicit_sign_key: Option<String>,
+}
+
+/// Scan `git commit` options respecting `--` and option-value arguments so values like
+/// `git commit -m -n` are never misread as flags (`R2-M5`), and `-S<key>` / `--gpg-sign=<key>`
+/// is preserved when re-signing the sealed commit (`R2-H4`).
+fn scan_commit_flags(commit_args: &[OsString]) -> CommitFlagScan {
+    let mut out = CommitFlagScan::default();
     let mut i = 0;
     while i < commit_args.len() {
         let Some(s) = commit_args[i].to_str() else {
@@ -938,23 +990,57 @@ fn is_preview_or_quiet_commit(commit_args: &[OsString]) -> bool {
             || s == "-q"
             || s == "--quiet"
         {
-            return true;
+            out.is_preview_or_quiet = true;
+            i += 1;
+            continue;
+        }
+        if s == "--no-verify" {
+            out.no_verify = true;
+            i += 1;
+            continue;
+        }
+        if s == "--no-gpg-sign" {
+            out.explicit_sign_key = None;
+            i += 1;
+            continue;
+        }
+        if let Some(k) = s.strip_prefix("--gpg-sign=") {
+            out.explicit_sign_key = if k.is_empty() {
+                None
+            } else {
+                Some(k.to_string())
+            };
+            i += 1;
+            continue;
+        }
+        if s == "--gpg-sign" {
+            i += 1;
+            continue;
         }
         if s.starts_with('-') && !s.starts_with("--") && s.len() >= 2 {
             for (idx, ch) in s[1..].char_indices() {
                 if matches!(ch, 'q' | 'z' | 'h') {
-                    return true;
-                }
-                // Options that consume the rest of this token as their argument (or next argv if at end)
-                if matches!(ch, 'm' | 'F' | 'c' | 'C' | 'u' | 'S') {
+                    out.is_preview_or_quiet = true;
+                } else if ch == 'n' {
+                    out.no_verify = true;
+                } else if ch == 'S' {
+                    let rest = &s[1 + idx + ch.len_utf8()..];
+                    if !rest.is_empty() {
+                        out.explicit_sign_key = Some(rest.to_string());
+                    }
+                    break;
+                } else if matches!(ch, 'm' | 'F' | 'c' | 'C' | 'u' | 't') {
                     let at_end = idx + ch.len_utf8() == s.len() - 1;
-                    if at_end && ch != 'u' && ch != 'S' {
+                    if at_end && ch != 'u' {
                         i += 1;
                     }
                     break;
                 }
             }
-        } else if matches!(
+            i += 1;
+            continue;
+        }
+        if matches!(
             s,
             "-m" | "--message"
                 | "-F"
@@ -963,6 +1049,8 @@ fn is_preview_or_quiet_commit(commit_args: &[OsString]) -> bool {
                 | "--reedit-message"
                 | "-C"
                 | "--reuse-message"
+                | "-t"
+                | "--template"
                 | "--fixup"
                 | "--squash"
                 | "--author"
@@ -976,7 +1064,7 @@ fn is_preview_or_quiet_commit(commit_args: &[OsString]) -> bool {
         }
         i += 1;
     }
-    false
+    out
 }
 
 /// Read `HEAD` reflog line count so `wrap_git_commit` ONLY seals or prints a summary if
@@ -996,7 +1084,8 @@ fn wrap_git_commit(
     depth: u32,
 ) -> i32 {
     let commit_args = &args[subcmd_idx + 1..];
-    if is_preview_or_quiet_commit(commit_args) || has_cli_disabled(cfg_overrides) == Some(true) {
+    let scanned = scan_commit_flags(commit_args);
+    if scanned.is_preview_or_quiet || has_cli_disabled(cfg_overrides) == Some(true) {
         return exec_or_spawn_os(real_git, args, depth + 1);
     }
 
@@ -1011,11 +1100,15 @@ fn wrap_git_commit(
     patched.push(OsString::from("-q"));
     patched.extend_from_slice(&args[subcmd_idx + 1..]);
 
-    let status = Command::new(real_git)
+    let mut commit_cmd = Command::new(real_git);
+    commit_cmd
         .args(&patched)
         .env("GIT_BUTTRESS_REAL_GIT", real_git)
-        .env("GIT_BUTTRESS_WRAP_DEPTH", (depth + 1).to_string())
-        .status();
+        .env("GIT_BUTTRESS_WRAP_DEPTH", (depth + 1).to_string());
+    if let Some(ref k) = scanned.explicit_sign_key {
+        commit_cmd.env("GIT_BUTTRESS_SIGN_KEY", k);
+    }
+    let status = commit_cmd.status();
     let code = match status {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
@@ -1055,12 +1148,8 @@ fn wrap_git_commit(
         },
     };
 
-    let skip_verify_flag = commit_args
-        .iter()
-        .any(|a| a == "-n" || a == "--no-verify");
-
-    let final_oid = if !disabled && !skip_verify_flag {
-        match seal_head(&mut repo, false, true) {
+    let final_oid = if !disabled && !scanned.no_verify {
+        match seal_head_with_key(&mut repo, false, scanned.explicit_sign_key.as_deref(), true) {
             Ok((oid, _)) => oid,
             Err(e) => {
                 eprintln!("git-buttress: stock commit was created, but BLAKE3 sealing failed: {e}");
@@ -1175,10 +1264,16 @@ fn wrap_git_fsck(
     }
     let cli_missing = cli_missing_override(cfg_overrides);
     match fsck_all_refs(&mut repo, cli_missing.as_deref()) {
-        Ok((matched, no_ev)) => {
-            eprintln!(
-                "buttress fsck: {matched} ref(s) verified with BLAKE3, {no_ev} ref(s) without buttress lines"
-            );
+        Ok((matched, partial, no_ev)) => {
+            if partial > 0 {
+                eprintln!(
+                    "buttress fsck: {matched} ref(s) verified with BLAKE3, {partial} ref(s) partially verified (shallow), {no_ev} ref(s) without buttress lines"
+                );
+            } else {
+                eprintln!(
+                    "buttress fsck: {matched} ref(s) verified with BLAKE3, {no_ev} ref(s) without buttress lines"
+                );
+            }
             0
         }
         Err(e) => {
@@ -1220,7 +1315,7 @@ fn exec_or_spawn_os(real_git: &Path, args: &[OsString], next_depth: u32) -> i32 
 pub fn fsck_all_refs(
     repo: &mut GitRepo,
     policy_override: Option<&str>,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize, usize), String> {
     let policy = MissingPolicy::from_repo(repo, policy_override)?;
     // 1. Validate ref-database structural integrity FIRST (`git refs verify` — `R2-H1` fix)!
     repo.run(["refs", "verify"], None)
@@ -1294,8 +1389,9 @@ pub fn fsck_all_refs(
     }
 
     let keys = ContextKeys::new();
-    let mut engine = Engine::new(repo, &keys, DigestCache::memory_only());
+    let mut engine = Engine::new_verifier(repo, &keys);
     let mut matched_refs = 0usize;
+    let mut partial_refs = 0usize;
     let mut no_evidence_refs = 0usize;
 
     for (oid, ref_b) in &refs {
@@ -1307,15 +1403,32 @@ pub fn fsck_all_refs(
 
         match verify_target_with_engine(&mut engine, *oid, ref_utf8, None, true) {
             Ok(CheckOutcome::Match { shallow_stops, .. }) => {
-                if shallow_stops > 0 && policy == MissingPolicy::Error {
-                    return Err(format!(
-                        "buttress: {ref_display} stopped at {shallow_stops} shallow boundary parent(s) (buttress.missing=error)"
-                    ));
+                if shallow_stops > 0 {
+                    match policy {
+                        MissingPolicy::Error => {
+                            return Err(format!(
+                                "buttress: {ref_display} stopped at {shallow_stops} shallow boundary parent(s) (buttress.missing=error)"
+                            ));
+                        }
+                        MissingPolicy::Warn => {
+                            eprintln!(
+                                "buttress: warning: {ref_display} verified partially ({shallow_stops} shallow boundary parent(s) skipped)"
+                            );
+                        }
+                        MissingPolicy::Silent => {}
+                    }
+                    partial_refs += 1;
+                } else {
+                    matched_refs += 1;
                 }
-                matched_refs += 1;
             }
-            Ok(CheckOutcome::NoEvidence { .. }) => {
+            Ok(CheckOutcome::NoEvidence { shallow_stops, .. }) => {
                 no_evidence_refs += 1;
+                if shallow_stops > 0 && policy == MissingPolicy::Warn {
+                    eprintln!(
+                        "buttress: warning: {ref_display} had {shallow_stops} shallow boundary parent(s) skipped"
+                    );
+                }
                 if !paired_plain_tags.contains(&(ref_b.clone(), *oid)) {
                     match policy {
                         MissingPolicy::Silent => {}
@@ -1345,7 +1458,7 @@ pub fn fsck_all_refs(
         }
     }
 
-    Ok((matched_refs, no_evidence_refs))
+    Ok((matched_refs, partial_refs, no_evidence_refs))
 }
 
 /// Standard Git hooks (`githooks(5)`), EXCLUDING `push-to-checkout` and `proc-receive` whose
@@ -1400,7 +1513,7 @@ pub fn enable_buttress(
     let canonical_hooks_dir = fs::canonicalize(&hooks_dir).unwrap_or_else(|_| hooks_dir.clone());
 
     let state_file = hooks_dir.join(".buttress-prev-hooks-path");
-    let current_cfg_hooks = read_git_config_path(&real_git, global, "core.hooksPath");
+    let current_cfg_hooks = read_git_config_path(&real_git, Some(global), "core.hooksPath");
     let is_already_ours = current_cfg_hooks
         .as_ref()
         .map(|p| {
@@ -1409,8 +1522,10 @@ pub fn enable_buttress(
         })
         .unwrap_or(false);
 
-    // Preserve the user's prior `core.hooksPath` across repeat `enable` runs!
-    let prev_hooks: Option<String> = if is_already_ours {
+    // Preserve the user's prior scoped `core.hooksPath` for exact restore on `disable`, AND
+    // for `--local` also inspect the effective inherited (global/system) `core.hooksPath` so
+    // local enable doesn't silently drop a pre-existing global hooks path (`R2-H5` fix)!
+    let saved_prev_hooks: Option<String> = if is_already_ours {
         fs::read_to_string(&state_file)
             .ok()
             .map(|s| s.trim_end_matches('\n').to_string())
@@ -1424,6 +1539,22 @@ pub fn enable_buttress(
         )?;
         p
     };
+
+    let global_buttress_hooks = env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".config").join("git-buttress").join("hooks"))
+        .map(|p| fs::canonicalize(&p).unwrap_or(p));
+    let forward_prev_hooks: Option<String> = if saved_prev_hooks.is_some() || global {
+        saved_prev_hooks
+    } else {
+        // Local enable with no prior local `core.hooksPath`: check inherited effective `core.hooksPath`
+        // (excluding our own global buttress hooks dir to avoid duplicate sealing).
+        read_git_config_path(&real_git, None, "core.hooksPath").filter(|p| {
+            let cp = fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+            cp != canonical_hooks_dir && global_buttress_hooks.as_ref() != Some(&cp)
+        })
+    };
+    let prev_hooks = forward_prev_hooks;
 
     let exe_str = self_exe
         .to_str()
@@ -1556,7 +1687,7 @@ pub fn disable_buttress(global: bool, wrapper_dir: Option<&Path>) -> Result<(), 
     let canonical_hooks_dir = fs::canonicalize(&hooks_dir).unwrap_or_else(|_| hooks_dir.clone());
     let state_file = hooks_dir.join(".buttress-prev-hooks-path");
 
-    let current_cfg = read_git_config_path(&real_git, global, "core.hooksPath");
+    let current_cfg = read_git_config_path(&real_git, Some(global), "core.hooksPath");
     let points_to_ours = current_cfg
         .as_ref()
         .map(|p| {
@@ -1653,13 +1784,17 @@ pub fn posix_single_quote(s: &str) -> String {
     out
 }
 
-fn read_git_config_path(real_git: &Path, global: bool, key: &str) -> Option<String> {
+fn read_git_config_path(real_git: &Path, scope_global: Option<bool>, key: &str) -> Option<String> {
     let mut c = Command::new(real_git);
     c.arg("config");
-    if global {
-        c.arg("--global");
-    } else {
-        c.arg("--local");
+    match scope_global {
+        Some(true) => {
+            c.arg("--global");
+        }
+        Some(false) => {
+            c.arg("--local");
+        }
+        None => {}
     }
     let out = c.args(["--get", "--path", key]).output().ok()?;
     if !out.status.success() {

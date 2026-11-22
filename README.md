@@ -104,7 +104,7 @@ $ git fsck --full
 ```
 
 Now look at what happens because Maya had `git-buttress` enabled when she made
-commit `9f3c1a2`—even though nobody ever used special tag names:
+commit `9f3c1a2`:
 
 1. **Against a collision swap (on *any* clone, even a brand-new one!):** When
    Maya committed the innocent file months ago, commit `9f3c1a2` baked in the
@@ -151,7 +151,7 @@ commit `9f3c1a2`—even though nobody ever used special tag names:
 What if an attacker goes even further than collisions—what if they have a full
 **second-preimage** break that lets them forge a brand-new replacement commit
 object with the exact SHA-1 `9f3c1a2` (stripping or rewriting the BLAKE3 lines),
-*and* Maya doesn't use SSH commit signing, *and* Dana is cloning for the very
+*and* Maya doesn't use SSH commit signing, *and* Sam is cloning for the very
 first time?
 
 For maintainers who want downstream dependency pins to survive even that
@@ -204,11 +204,12 @@ cargo test --release
 * **How `git commit` and `git fsck` stay seamless:** `git buttress enable`
   configures global Git hooks (`post-commit` for commit/rebase/cherry-pick
   sealing and `reference-transaction` for `clone`/`fetch`/`pull` verification,
-  forwarding all 28 standard Git hooks to any prior `core.hooksPath` or
-  `.git/hooks/`) **plus** a tiny transparent `git` wrapper in `~/.local/bin/git`.
-  On `git commit`, `post-commit` rewrites the new local commit with BLAKE3
-  headers via `git update-ref` compare-and-swap while the wrapper holds `-q` so
-  terminal output prints only the final `[branch <sealed-sha>]` summary; on
+  forwarding standard Git hooks to any prior `core.hooksPath` or `.git/hooks/`)
+  **plus** a tiny transparent `git` wrapper in `~/.local/bin/git`. On
+  `git commit`, `post-commit` rewrites the new local commit with BLAKE3 headers
+  via `git update-ref` compare-and-swap (preserving explicit `-S<key>` signing
+  keys and verifying ancestor seals before signing) while the wrapper holds `-q`
+  so terminal output prints only the final `[branch <sealed-sha>]` summary; on
   `git fsck`, it runs stock `git fsck` followed automatically by
   `git buttress fsck`. (`refs/replace/*` grafts are ignored during verification;
   do not rely on `refs/replace` when consuming verified repositories.)
