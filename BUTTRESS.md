@@ -235,9 +235,11 @@ fraction of a second. After that, a commit hashes only what changed.
 
 Two cautions. The measuring program held up to 8.3 GB of directories in
 memory while they waited for their subdirectories; it needs a better
-reading order before it suits a smaller machine. And branch `next` is
-unreleased code. An earlier, simpler program on release 0.9.1 (one Git
-process, a temporary file) took 6 min 19 s to 6 min 48 s.
+reading order before it suits a smaller machine. And those Linux-kernel
+measurements used an experimental `blake3-servil` `next` branch; an earlier,
+simpler program on release 0.9.1 (one Git process, a temporary file) took
+6 min 19 s to 6 min 48 s. The current `git-buttress` crate builds on
+`blake3-servil-core` `0.10.0` from crates.io.
 
 For scale: the bench-hashes project publishes, for the same machine model
 and a collection shaped like Git's objects, 0.18 ns per byte for
@@ -265,7 +267,7 @@ detection, the kind of SHA-1 Git uses.
 ## 11. Open Items for Future Versions
 
 * Finalizing context strings prior to a `1.0` freeze.
-* Branch-name public-key pinning and forge squash/rebase commit-message
-  trailers.
+* Branch-name verifying-key pinning (explored in the companion tool `git-signet`)
+  and forge squash/rebase commit-message trailers.
 * Defining a construction for `sha256` lines if needed by SHA-256-only
   environments.

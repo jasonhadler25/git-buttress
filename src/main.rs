@@ -93,9 +93,9 @@ fn dispatch(cmd: &str, rest: &[String]) -> Result<i32, String> {
         "seal-head" => cmd_seal_head(rest),
         "-V" | "--version" | "version" => {
             println!(
-                "git-buttress {} (blake3-servil {})",
+                "git-buttress {} (blake3-servil-core {})",
                 env!("CARGO_PKG_VERSION"),
-                blake3_servil::BUILD_VERSION
+                blake3_servil_core::BUILD_VERSION
             );
             Ok(0)
         }

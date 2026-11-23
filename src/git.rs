@@ -18,7 +18,7 @@
 
 use crate::cache::{Dig, Oid};
 use crate::protocol::ContextKeys;
-use blake3_servil::Mode;
+use blake3_servil_core::Mode;
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -609,7 +609,7 @@ impl GitRepo {
 
         // Drain exact `size` bytes in 64 KiB chunks into a streaming BLAKE3 Hasher!
         let mut hasher =
-            blake3_servil::convenience::Hasher::new(Mode::DeriveKeyWith(&keys.file), Some(size));
+            blake3_servil_core::convenience::Hasher::new(Mode::DeriveKeyWith(&keys.file), Some(size));
         let mut buf = [0u8; 65536];
         let mut rem = size;
         while rem > 0 {

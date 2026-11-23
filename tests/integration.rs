@@ -1789,3 +1789,479 @@ fn astra_audit_round2_regressions() {
         "R2-H2: shallow-truncated refs must be counted separately in partial_m (got partial={partial_m}, no_ev={no_ev_m})"
     );
 }
+
+#[test]
+fn x509_and_openpgp_signing_sealing_and_error_paths() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sb = TempSandbox::new();
+    let enable = sb.run_buttress(&sb.root, &["enable", "--global", "--bin-dir", sb.bin.to_str().unwrap()]);
+    assert!(enable.status.success(), "enable failed: {:?}", enable);
+
+    let repo_dir = sb.root.join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    assert!(sb.run_user_git(&repo_dir, &["init", "-q"]).status.success());
+    assert!(sb.run_user_git(&repo_dir, &["config", "user.name", "Maya Signer"]).status.success());
+    assert!(sb.run_user_git(&repo_dir, &["config", "user.email", "maya@example.com"]).status.success());
+
+    // Mock X.509 signing program (mimics gpgsm / gitsign): logs argv + payload and emits CMS armor.
+    let argv_log = sb.root.join("x509-argv.log");
+    let payload_log = sb.root.join("x509-payload.log");
+    let mock_x509 = sb.root.join("mock-x509.sh");
+    fs::write(
+        &mock_x509,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" > '{}'\n\
+             cat > '{}'\n\
+             printf '[GNUPG:] SIG_CREATED D 1 8 00 1700000000 0000\\n' >&2\n\
+             printf -- '-----BEGIN SIGNED MESSAGE-----\\nMOCK-X509-SIG\\n-----END SIGNED MESSAGE-----\\n'\n",
+            argv_log.display(),
+            payload_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&mock_x509, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 1. gpg.format=x509 with user.signingkey set: `git commit -S` seals AND signs over BLAKE3 headers!
+    assert!(sb.run_user_git(&repo_dir, &["config", "gpg.format", "x509"]).status.success());
+    assert!(
+        sb.run_user_git(&repo_dir, &["config", "gpg.x509.program", mock_x509.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(sb.run_user_git(&repo_dir, &["config", "user.signingkey", "CN=Maya"]).status.success());
+    fs::write(repo_dir.join("a.txt"), "hello x509\n").unwrap();
+    assert!(sb.run_user_git(&repo_dir, &["add", "a.txt"]).status.success());
+    let c1 = sb.run_user_git(&repo_dir, &["commit", "-S", "-m", "X509 signed commit"]);
+    assert!(
+        c1.status.success(),
+        "x509 commit failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&c1.stdout),
+        String::from_utf8_lossy(&c1.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&c1.stderr).contains("unsupported gpg.format"),
+        "dogfooding bug regression: stderr={}",
+        String::from_utf8_lossy(&c1.stderr)
+    );
+
+    let raw_c1 = sb.run_stock_git(&repo_dir, &["cat-file", "commit", "HEAD"]);
+    let raw_c1_str = String::from_utf8_lossy(&raw_c1.stdout);
+    assert!(raw_c1_str.contains("buttress-tree blake3 "), "commit must carry BLAKE3 seal:\n{raw_c1_str}");
+    assert!(
+        raw_c1_str.contains("gpgsig -----BEGIN SIGNED MESSAGE-----"),
+        "commit must carry X.509 signature:\n{raw_c1_str}"
+    );
+    // Verify the final signing call (from git-buttress) signed the payload INCLUDING `buttress-tree blake3`
+    // and passed Git's exact `--status-fd=2 -bsau <key>` argv!
+    let logged_argv = fs::read_to_string(&argv_log).unwrap();
+    assert_eq!(logged_argv.trim(), "--status-fd=2 -bsau CN=Maya");
+    let logged_payload = fs::read_to_string(&payload_log).unwrap();
+    assert!(
+        logged_payload.contains("buttress-tree blake3 "),
+        "X.509 signature must cover buttress-tree header:\n{logged_payload}"
+    );
+    let chk = sb.run_buttress(&repo_dir, &["check", "HEAD", "--no-shallow"]);
+    assert!(chk.status.success(), "check HEAD failed: {:?}", chk);
+
+    // 2. Explicit `-S<alt-key>` overrides `user.signingkey` under gpg.format=x509
+    fs::write(repo_dir.join("b.txt"), "alt key\n").unwrap();
+    assert!(sb.run_user_git(&repo_dir, &["add", "b.txt"]).status.success());
+    let c2 = sb.run_user_git(&repo_dir, &["commit", "-SCN=AltKey", "-m", "X509 alt key"]);
+    assert!(c2.status.success(), "x509 -S alt failed: {:?}", c2);
+    assert_eq!(fs::read_to_string(&argv_log).unwrap().trim(), "--status-fd=2 -bsau CN=AltKey");
+    assert!(sb.run_buttress(&repo_dir, &["check", "HEAD", "--no-shallow"]).status.success());
+
+    // 3. gpg.format=x509 WITHOUT user.signingkey falls back to committer identity `Name <email>`
+    assert!(sb.run_user_git(&repo_dir, &["config", "--unset", "user.signingkey"]).status.success());
+    fs::write(repo_dir.join("c.txt"), "fallback ident\n").unwrap();
+    assert!(sb.run_user_git(&repo_dir, &["add", "c.txt"]).status.success());
+    let c3 = sb.run_user_git(&repo_dir, &["commit", "-S", "-m", "X509 fallback ident"]);
+    assert!(c3.status.success(), "x509 fallback ident failed: {:?}", c3);
+    assert_eq!(
+        fs::read_to_string(&argv_log).unwrap().trim(),
+        "--status-fd=2 -bsau Maya Signer <maya@example.com>"
+    );
+    assert!(sb.run_buttress(&repo_dir, &["check", "HEAD", "--no-shallow"]).status.success());
+
+    // 4. Error paths on sign_payload: missing SIG_CREATED, empty output, and unsupported format
+    let bad_no_status = sb.root.join("mock-no-status.sh");
+    fs::write(
+        &bad_no_status,
+        "#!/bin/sh\ncat >/dev/null\nprintf -- '-----BEGIN SIGNED MESSAGE-----\\nX\\n-----END SIGNED MESSAGE-----\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&bad_no_status, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        sb.run_user_git(&repo_dir, &["config", "gpg.x509.program", bad_no_status.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let repo = GitRepo::open(Some(&repo_dir)).unwrap();
+    let err_no_status = git_buttress::hooks::sign_payload(&repo, b"payload", Some("CN=Maya")).unwrap_err();
+    assert!(
+        err_no_status.contains("failed to create X.509 signature"),
+        "expected SIG_CREATED failure, got: {err_no_status}"
+    );
+
+    let bad_empty = sb.root.join("mock-empty.sh");
+    fs::write(
+        &bad_empty,
+        "#!/bin/sh\ncat >/dev/null\nprintf '[GNUPG:] SIG_CREATED D 1 8 00 1700000000 0000\\n' >&2\n",
+    )
+    .unwrap();
+    fs::set_permissions(&bad_empty, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        sb.run_user_git(&repo_dir, &["config", "gpg.x509.program", bad_empty.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let err_empty = git_buttress::hooks::sign_payload(&repo, b"payload", Some("CN=Maya")).unwrap_err();
+    assert!(
+        err_empty.contains("empty signature output"),
+        "expected empty output error, got: {err_empty}"
+    );
+
+    // 5. OpenPGP: `gpg.openpgp.program` takes precedence over legacy `gpg.program`, and falls back when unset
+    let mock_pgp = sb.root.join("mock-pgp.sh");
+    fs::write(
+        &mock_pgp,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" > '{}'\n\
+             cat >/dev/null\n\
+             printf '[GNUPG:] SIG_CREATED D 1 8 00 1700000000 0000\\n' >&2\n\
+             printf -- '-----BEGIN PGP SIGNATURE-----\\nMOCK-PGP\\n-----END PGP SIGNATURE-----\\n'\n",
+            argv_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&mock_pgp, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(sb.run_user_git(&repo_dir, &["config", "gpg.format", "openpgp"]).status.success());
+    assert!(
+        sb.run_user_git(&repo_dir, &["config", "gpg.program", mock_pgp.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let sig_pgp = git_buttress::hooks::sign_payload(&repo, b"payload", None).unwrap();
+    assert!(sig_pgp.starts_with(b"-----BEGIN PGP SIGNATURE-----"));
+    assert_eq!(fs::read_to_string(&argv_log).unwrap().trim(), "--status-fd=2 -bsa");
+
+    // Explicit gpg.openpgp.program overrides legacy gpg.program
+    assert!(
+        sb.run_user_git(&repo_dir, &["config", "gpg.openpgp.program", bad_empty.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let err_override = git_buttress::hooks::sign_payload(&repo, b"payload", None).unwrap_err();
+    assert!(err_override.contains("empty signature output"));
+
+    // 6. Unsupported gpg.format fails explicitly
+    assert!(sb.run_user_git(&repo_dir, &["config", "gpg.format", "bogus"]).status.success());
+    let err_fmt = git_buttress::hooks::sign_payload(&repo, b"payload", None).unwrap_err();
+    assert!(err_fmt.contains("unsupported gpg.format=\"bogus\""), "got: {err_fmt}");
+}
+
+#[test]
+fn cli_subcommands_hooks_and_legacy_forwarding_coverage() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sb = TempSandbox::new();
+
+    // --- 1. Top-level CLI help / version / unknown subcommand ---
+    for help_args in [&[][..], &["-h"][..], &["--help"][..], &["help"][..]] {
+        let out = sb.run_buttress(&sb.root, help_args);
+        assert!(out.status.success(), "help {help_args:?} failed");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("USAGE:"));
+    }
+    let ver = sb.run_buttress(&sb.root, &["--version"]);
+    assert!(ver.status.success());
+    assert!(String::from_utf8_lossy(&ver.stdout).contains("git-buttress"));
+    let unk = sb.run_buttress(&sb.root, &["no-such-cmd"]);
+    assert_eq!(unk.status.code(), Some(1));
+
+    // --- 2. enable / disable argument validation + legacy core.hooksPath forwarding ---
+    assert_eq!(
+        sb.run_buttress(&sb.root, &["enable", "--global", "--local"]).status.code(),
+        Some(1)
+    );
+    assert_eq!(
+        sb.run_buttress(&sb.root, &["enable", "--bin-dir"]).status.code(),
+        Some(1)
+    );
+    assert_eq!(
+        sb.run_buttress(&sb.root, &["enable", "--bogus"]).status.code(),
+        Some(1)
+    );
+    assert_eq!(
+        sb.run_buttress(&sb.root, &["disable", "--global", "--local"]).status.code(),
+        Some(1)
+    );
+    assert_eq!(
+        sb.run_buttress(&sb.root, &["disable", "--bin-dir"]).status.code(),
+        Some(1)
+    );
+    assert_eq!(
+        sb.run_buttress(&sb.root, &["disable", "--bogus"]).status.code(),
+        Some(1)
+    );
+
+    // Enable globally with legacy core.hooksPath forced + prior hook directory to test binary forwarding!
+    let prev_hooks = sb.root.join("prev-hooks");
+    fs::create_dir_all(&prev_hooks).unwrap();
+    let prev_reftx_log = sb.root.join("prev-reftx.log");
+    let prev_precommit_log = sb.root.join("prev-precommit.log");
+    fs::write(
+        prev_hooks.join("reference-transaction"),
+        format!("#!/bin/sh\ncat >> '{}'\n", prev_reftx_log.display()),
+    )
+    .unwrap();
+    fs::set_permissions(prev_hooks.join("reference-transaction"), fs::Permissions::from_mode(0o755))
+        .unwrap();
+    fs::write(
+        prev_hooks.join("pre-commit"),
+        format!("#!/bin/sh\necho ran >> '{}'\n", prev_precommit_log.display()),
+    )
+    .unwrap();
+    fs::set_permissions(prev_hooks.join("pre-commit"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        Command::new(&sb.real_git)
+            .env("HOME", &sb.home)
+            .args(["config", "--global", "core.hooksPath", prev_hooks.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let leg_enable = Command::new(&sb.buttress_bin)
+        .current_dir(&sb.root)
+        .env("HOME", &sb.home)
+        .env("GIT_BUTTRESS_FORCE_LEGACY_HOOKSPATH", "1")
+        .args(["enable", "--global", "--bin-dir", sb.bin.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(leg_enable.status.success(), "legacy enable failed: {:?}", leg_enable);
+    assert!(sb.bin.join("git").is_file());
+
+    let repo_dir = sb.root.join("cli-repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    assert!(sb.run_user_git(&repo_dir, &["init", "-q"]).status.success());
+    fs::write(repo_dir.join("hello.txt"), "hello world\n").unwrap();
+    assert!(sb.run_user_git(&repo_dir, &["add", "hello.txt"]).status.success());
+    let c1 = sb.run_user_git(&repo_dir, &["commit", "-m", "Root\x1b[31mCommit"]);
+    assert!(c1.status.success(), "root commit failed: {:?}", c1);
+    let c1_stdout = String::from_utf8_lossy(&c1.stdout);
+    assert!(c1_stdout.contains("(root-commit)"), "expected root-commit summary: {c1_stdout}");
+    assert!(prev_precommit_log.is_file(), "legacy pre-commit hook must have been forwarded");
+    assert!(
+        fs::read_to_string(&prev_reftx_log).unwrap_or_default().contains("refs/heads/main"),
+        "legacy reference-transaction hook must have received stdin"
+    );
+
+    // Disable globally: removes wrapper and restores prior core.hooksPath!
+    let dis_g = sb.run_buttress(&sb.root, &["disable", "--global", "--bin-dir", sb.bin.to_str().unwrap()]);
+    assert!(dis_g.status.success(), "disable --global failed: {:?}", dis_g);
+    assert!(!sb.bin.join("git").exists(), "wrapper must be removed on disable");
+    let restored_hp = Command::new(&sb.real_git)
+        .env("HOME", &sb.home)
+        .args(["config", "--global", "--get", "core.hooksPath"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&restored_hp.stdout).trim(),
+        prev_hooks.to_str().unwrap()
+    );
+
+    // Re-enable cleanly (native hooks on Git 2.56+, unset prev_hooks first)
+    let _ = Command::new(&sb.real_git)
+        .env("HOME", &sb.home)
+        .args(["config", "--global", "--unset", "core.hooksPath"])
+        .status();
+    let nat_en = sb.run_buttress(&sb.root, &["enable", "--global", "--bin-dir", sb.bin.to_str().unwrap()]);
+    assert!(nat_en.status.success());
+
+    // Plain commit via `-c buttress.disabled=true` AND via `-n` (no-verify) AND `--dry-run`
+    fs::write(repo_dir.join("hello.txt"), "plain via disabled\n").unwrap();
+    assert!(sb.run_user_git(&repo_dir, &["add", "hello.txt"]).status.success());
+    let dry = sb.run_user_git(&repo_dir, &["commit", "--dry-run", "-m", "nope"]);
+    assert!(dry.status.success());
+    let head_before = String::from_utf8_lossy(&sb.run_stock_git(&repo_dir, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    let c_dis = sb.run_user_git(&repo_dir, &["-c", "buttress.disabled=true", "commit", "-m", "Plain disabled"]);
+    assert!(c_dis.status.success());
+    let head_dis = String::from_utf8_lossy(&sb.run_stock_git(&repo_dir, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    assert_ne!(head_before, head_dis);
+    let raw_dis = String::from_utf8_lossy(&sb.run_stock_git(&repo_dir, &["cat-file", "commit", "HEAD"]).stdout)
+        .to_string();
+    assert!(!raw_dis.contains("buttress-tree blake3"), "-c buttress.disabled=true must leave commit plain");
+
+    // --- 3. `id` CLI on commit, tree, blob, annotated tag, and invalid args ---
+    let id_commit = sb.run_buttress(&repo_dir, &["id", "HEAD"]);
+    assert!(id_commit.status.success());
+    assert_eq!(String::from_utf8_lossy(&id_commit.stdout).trim().len(), 64);
+    let id_tree = sb.run_buttress(&repo_dir, &["id", "HEAD^{tree}"]);
+    assert!(id_tree.status.success());
+    assert_eq!(String::from_utf8_lossy(&id_tree.stdout).trim().len(), 64);
+    let id_blob = sb.run_buttress(&repo_dir, &["id", "HEAD:hello.txt"]);
+    assert!(id_blob.status.success());
+    assert_eq!(String::from_utf8_lossy(&id_blob.stdout).trim().len(), 64);
+    assert!(sb.run_stock_git(&repo_dir, &["tag", "-a", "v0.1", "-m", "ann tag"]).status.success());
+    let id_tag = sb.run_buttress(&repo_dir, &["id", "v0.1"]);
+    assert!(id_tag.status.success());
+    assert_eq!(id_tag.stdout, id_commit.stdout);
+    assert_eq!(sb.run_buttress(&repo_dir, &["id", "HEAD", "extra"]).status.code(), Some(1));
+    assert_eq!(sb.run_buttress(&repo_dir, &["id", "--bogus"]).status.code(), Some(1));
+
+    // --- 4. `check` CLI missing policies (silent / warn / error) + arg validation ---
+    let chk_silent = sb.run_buttress(&repo_dir, &["check", "HEAD", "--missing", "silent"]);
+    assert_eq!(chk_silent.status.code(), Some(0));
+    let chk_warn = sb.run_buttress(&repo_dir, &["check", "HEAD", "--missing", "warn"]);
+    assert_eq!(chk_warn.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&chk_warn.stderr).contains("NO EVIDENCE"));
+    let chk_err = sb.run_buttress(&repo_dir, &["check", "HEAD", "--missing", "error"]);
+    assert_eq!(chk_err.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&chk_err.stderr).contains("NO EVIDENCE"));
+    assert_eq!(
+        sb.run_buttress(&repo_dir, &["check", "--expect", "0".repeat(64).as_str(), "--expect", "0".repeat(64).as_str()])
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(
+        sb.run_buttress(&repo_dir, &["check", "--missing", "warn", "--missing", "error"]).status.code(),
+        Some(1)
+    );
+    assert_eq!(sb.run_buttress(&repo_dir, &["check", "HEAD", "HEAD"]).status.code(), Some(1));
+    assert_eq!(sb.run_buttress(&repo_dir, &["check", "--unknown"]).status.code(), Some(1));
+
+    // --- 5. `fsck` CLI + wrapper `-c buttress.missing=error fsck` + detached HEAD ---
+    let fsck_warn = sb.run_buttress(&repo_dir, &["fsck", "--missing", "warn"]);
+    assert!(fsck_warn.status.success());
+    assert!(String::from_utf8_lossy(&fsck_warn.stdout).contains("without buttress lines"));
+    assert!(String::from_utf8_lossy(&fsck_warn.stderr).contains("has no BLAKE3 buttress evidence"));
+    let fsck_err = sb.run_buttress(&repo_dir, &["fsck", "--missing", "error"]);
+    assert_eq!(fsck_err.status.code(), Some(1));
+    assert_eq!(
+        sb.run_buttress(&repo_dir, &["fsck", "--missing", "warn", "--missing", "error"]).status.code(),
+        Some(1)
+    );
+    assert_eq!(sb.run_buttress(&repo_dir, &["fsck", "--bogus"]).status.code(), Some(1));
+    let wrap_fsck_err = sb.run_user_git(&repo_dir, &["-c", "buttress.missing=error", "fsck"]);
+    assert_eq!(wrap_fsck_err.status.code(), Some(1));
+
+    // --- 6. `log` CLI (-n, -nN, --max-count, invalid args, status tags) ---
+    let log_out = sb.run_buttress(&repo_dir, &["log", "-n", "2", "HEAD"]);
+    assert!(log_out.status.success(), "log failed: {:?}", log_out);
+    let log_str = String::from_utf8_lossy(&log_out.stdout);
+    assert!(log_str.contains("[plain     ]"), "expected plain commit in log:\n{log_str}");
+    assert!(log_str.contains("[buttressed]"), "expected buttressed commit in log:\n{log_str}");
+    assert!(!log_str.contains('\x1b'), "ANSI escape must be sanitized in log");
+    assert!(sb.run_buttress(&repo_dir, &["log", "-n1"]).status.success());
+    assert!(sb.run_buttress(&repo_dir, &["log", "--max-count", "1"]).status.success());
+    assert_eq!(sb.run_buttress(&repo_dir, &["log", "-n", "abc"]).status.code(), Some(1));
+    assert_eq!(sb.run_buttress(&repo_dir, &["log", "--bogus"]).status.code(), Some(1));
+    assert_eq!(sb.run_buttress(&repo_dir, &["log", "HEAD", "extra"]).status.code(), Some(1));
+
+    // --- 7. `seal-head` CLI + `--local` disable + detached HEAD fsck/commit ---
+    assert_eq!(sb.run_buttress(&repo_dir, &["seal-head", "--bogus"]).status.code(), Some(1));
+    let sh_q = sb.run_buttress(&repo_dir, &["seal-head", "-q"]);
+    assert!(sh_q.status.success());
+    assert!(sb.run_buttress(&repo_dir, &["check", "HEAD", "--no-shallow"]).status.success());
+
+    // Detached HEAD check via fsck_all_refs and wrapper commit
+    assert!(sb.run_stock_git(&repo_dir, &["checkout", "-q", "--detach", "HEAD"]).status.success());
+    fs::write(repo_dir.join("det.txt"), "detached\n").unwrap();
+    assert!(sb.run_user_git(&repo_dir, &["add", "det.txt"]).status.success());
+    let det_c = sb.run_user_git(&repo_dir, &["commit", "-m", "Detached seal"]);
+    assert!(det_c.status.success(), "detached commit failed: {:?}", det_c);
+    assert!(String::from_utf8_lossy(&det_c.stdout).contains("[detached HEAD "));
+    let fsck_det = sb.run_buttress(&repo_dir, &["fsck"]);
+    assert!(fsck_det.status.success());
+
+    // Local disable sets buttress.disabled=true and skips sealing
+    assert!(sb.run_stock_git(&repo_dir, &["checkout", "-q", "main"]).status.success());
+    let dis_l = sb.run_buttress(&repo_dir, &["disable", "--local"]);
+    assert!(dis_l.status.success());
+    fs::write(repo_dir.join("after-dis.txt"), "unsealed\n").unwrap();
+    assert!(sb.run_stock_git(&repo_dir, &["add", "after-dis.txt"]).status.success());
+    assert!(sb.run_stock_git(&repo_dir, &["commit", "-q", "-m", "Unsealed local"]).status.success());
+    assert!(sb.run_buttress(&repo_dir, &["seal-head"]).status.success());
+    let raw_after = String::from_utf8_lossy(&sb.run_stock_git(&repo_dir, &["cat-file", "commit", "HEAD"]).stdout)
+        .to_string();
+    assert!(!raw_after.contains("buttress-tree blake3"), "local disable must prevent seal-head");
+
+    // --- 8. Prepared hook under MissingPolicy::Warn and MissingPolicy::Error + shallow clone fsck ---
+    let plain_src = sb.root.join("plain-src");
+    fs::create_dir_all(&plain_src).unwrap();
+    assert!(sb.run_stock_git(&plain_src, &["init", "-q", "-b", "main"]).status.success());
+    fs::write(plain_src.join("f.txt"), "one\n").unwrap();
+    assert!(sb.run_stock_git(&plain_src, &["add", "f.txt"]).status.success());
+    assert!(sb.run_stock_git(&plain_src, &["commit", "-q", "-m", "plain 1"]).status.success());
+
+    let dst = sb.root.join("fetch-dst");
+    fs::create_dir_all(&dst).unwrap();
+    assert!(sb.run_user_git(&dst, &["init", "-q", "-b", "main"]).status.success());
+    assert!(sb.run_user_git(&dst, &["remote", "add", "origin", &format!("file://{}", plain_src.display())]).status.success());
+    // Under buttress.missing=warn: fetch succeeds AND prints warning on stderr
+    assert!(sb.run_user_git(&dst, &["config", "buttress.missing", "warn"]).status.success());
+    let f_warn = sb.run_user_git(&dst, &["fetch", "origin", "main"]);
+    assert!(
+        f_warn.status.success(),
+        "fetch under warn should succeed: {}",
+        String::from_utf8_lossy(&f_warn.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&f_warn.stderr).contains("has no BLAKE3 buttress evidence"),
+        "expected warn stderr, got: {}",
+        String::from_utf8_lossy(&f_warn.stderr)
+    );
+    // Under buttress.missing=error: local branch commit SUCCEEDS (`!is_local_branch_update` guard)
+    // while fetching plain tag/remote is REJECTED!
+    assert!(sb.run_user_git(&dst, &["config", "buttress.missing", "error"]).status.success());
+    fs::write(dst.join("local.txt"), "local\n").unwrap();
+    assert!(sb.run_user_git(&dst, &["add", "local.txt"]).status.success());
+    let loc_c = sb.run_user_git(&dst, &["commit", "-m", "Local commit under missing=error"]);
+    assert!(
+        loc_c.status.success(),
+        "local commit must succeed under buttress.missing=error (R2-H3): stderr={}",
+        String::from_utf8_lossy(&loc_c.stderr)
+    );
+    assert!(sb.run_stock_git(&plain_src, &["tag", "plain-tag"]).status.success());
+    let f_err = sb.run_user_git(&dst, &["fetch", "origin", "refs/tags/plain-tag:refs/tags/plain-tag"]);
+    assert!(
+        !f_err.status.success(),
+        "fetching plain tag under buttress.missing=error must be rejected"
+    );
+
+    // Shallow clone of a repo with 2 sealed commits: depth=1 leaves a sealed HEAD with a shallow parent!
+    let sh_src = sb.root.join("shallow-src");
+    fs::create_dir_all(&sh_src).unwrap();
+    assert!(sb.run_user_git(&sh_src, &["init", "-q", "-b", "main"]).status.success());
+    fs::write(sh_src.join("s.txt"), "one\n").unwrap();
+    assert!(sb.run_user_git(&sh_src, &["add", "s.txt"]).status.success());
+    assert!(sb.run_user_git(&sh_src, &["commit", "-m", "Sealed 1"]).status.success());
+    fs::write(sh_src.join("s.txt"), "two\n").unwrap();
+    assert!(sb.run_user_git(&sh_src, &["add", "s.txt"]).status.success());
+    assert!(sb.run_user_git(&sh_src, &["commit", "-m", "Sealed 2"]).status.success());
+
+    let sh_dst = sb.root.join("shallow-cli");
+    assert!(
+        sb.run_stock_git(&sb.root, &["clone", "--depth=1", &format!("file://{}", sh_src.display()), sh_dst.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let sh_chk_warn = sb.run_buttress(&sh_dst, &["check", "HEAD", "--missing", "warn"]);
+    assert!(sh_chk_warn.status.success());
+    assert!(String::from_utf8_lossy(&sh_chk_warn.stdout).contains("PARTIAL MATCH"));
+    let sh_chk_err = sb.run_buttress(&sh_dst, &["check", "HEAD", "--missing", "error"]);
+    assert_eq!(sh_chk_err.status.code(), Some(1));
+    let sh_fsck_warn = sb.run_buttress(&sh_dst, &["fsck", "--missing", "warn"]);
+    assert!(sh_fsck_warn.status.success());
+    assert!(String::from_utf8_lossy(&sh_fsck_warn.stdout).contains("partially verified (shallow)"));
+    let sh_fsck_err = sb.run_buttress(&sh_dst, &["fsck", "--missing", "error"]);
+    assert_eq!(sh_fsck_err.status.code(), Some(1));
+}

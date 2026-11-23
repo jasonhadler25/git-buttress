@@ -38,7 +38,7 @@ Maya runs one setup command on her laptop:
 
 ```text
 $ git buttress enable --global
-Configured global Git hooks for git-buttress at ~/.config/git-buttress/hooks
+Configured global native Git hooks ([hook "buttress-*"])
 Installed transparent `git` wrapper at ~/.local/bin/git
 ```
 
@@ -130,13 +130,13 @@ commit `9f3c1a2`:
    audit, Sam's local `buttress-tree` and `buttress-parent` lines catch it
    immediately.
 
-3. **If Maya signs commits with SSH/GPG (`git commit -S`) and Sam verifies her
-   key (`git verify-commit`):** Without `git-buttress`, a Git commit signature
-   only signs SHA-1 hashes—so swapping a file for a SHA1DC twin **leaves
-   `git verify-commit` completely green!** With `git-buttress`, Maya's normal
-   SSH signature automatically covers the BLAKE3 fingerprints inside the commit
-   header, so verifying her signature + `git buttress check` protects even
-   brand-new users against a total SHA-1 break.
+3. **If Maya signs commits (`git commit -S`, supporting SSH, X.509, and OpenPGP)
+   and Sam verifies her verifying key (`git verify-commit`):** Without `git-buttress`,
+   a Git commit signature only signs SHA-1 hashes—so swapping a file for a SHA1DC
+   twin **leaves `git verify-commit` completely green!** With `git-buttress`,
+   Maya's commit signature automatically covers the BLAKE3 fingerprints inside
+   the commit header, so verifying her signature + `git buttress check` protects
+   even brand-new users against a total SHA-1 break.
 
 4. **Sorting clean backups from poisoned mirrors:** Maya has five mirrors and
    laptops all reporting `HEAD = 9f3c1a2`. Running `git fsck` immediately shows

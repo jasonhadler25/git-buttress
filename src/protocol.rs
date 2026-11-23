@@ -2,8 +2,8 @@
 
 use crate::cache::{Dig, DigestCache, Oid, OidMap};
 use crate::git::{ObjKind, ObjectStore, StoreError, StoreErrorKind, hex_to_32, hex_to_oid, to_hex};
-use blake3_servil::throughput::context_key;
-use blake3_servil::{ContextKey, Mode, convenience};
+use blake3_servil_core::throughput::context_key;
+use blake3_servil_core::{ContextKey, Mode, convenience};
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 
@@ -31,7 +31,7 @@ impl Default for ContextKeys {
 
 impl ContextKeys {
     pub fn new() -> Self {
-        blake3_servil::initialize();
+        blake3_servil_core::initialize();
         Self {
             file: context_key(CTX_FILE),
             dir: context_key(CTX_DIR),

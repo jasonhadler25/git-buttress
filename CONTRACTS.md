@@ -100,13 +100,13 @@ Over an acyclic subgraph in `objects(S)`:
    leading 256 bytes contain `WRAPPER_MARKER`, preventing `git-buttress` and
    `~/.local/bin/git` from invoking each other in a loop even if
    `GIT_BUTTRESS_REAL_GIT` is unset or corrupted to point at the wrapper.
-4. **TB-4 (Dependency note — `blake3-servil` 0.9.1):** `Cargo.toml` depends on
-   `blake3-servil` `0.9.1` with default features (`std` only; `zeroize` is
-   **not** enabled). Every hash computation in `git-buttress` uses either
+4. **TB-4 (Dependency note — `blake3-servil-core` `=0.10.0`):** `Cargo.toml`
+   depends on `blake3-servil-core = "=0.10.0"` from crates.io (single-threaded
+   core with no thread pool and no `zeroize` feature, verified in `Cargo.lock`
+   by both SHA-256 `checksum` and a BLAKE3+SHA-256 hashset checked in CI).
+   Every hash computation in `git-buttress` uses either
    `convenience::hash_with(Mode::DeriveKeyWith(&ContextKey), slice)` or a fresh
-   per-blob `convenience::Hasher::new(Mode::DeriveKeyWith(&ContextKey), ...)`—never
-   `Zeroize` and never `throughput::update_each`—so GHSA-v237-j9h9-8pf7 does not
-   affect `git-buttress`.
+   per-blob `convenience::Hasher::new(Mode::DeriveKeyWith(&ContextKey), ...)`.
 
 ---
 
@@ -311,22 +311,35 @@ contract seal_head(repo: &mut GitRepo, force_sign: bool, quiet: bool) -> Result<
     - If `head_oid` is `Sealed`: verifies its existing claims against a fresh memory-only `Engine`;
       if they contradict the store, returns `Err` (NEVER overwrites tampering evidence!).
       If valid and (`!force_sign || old.has_gpgsig`), returns `(head_oid, dig)` unchanged.
-    - Uses `DigestCache::memory_only()` whenever signing (`force_sign || old.has_gpgsig`), verifies
-      `SIG_CREATED` / SSH armor on `sign_payload` via a mode-0700 exclusive temp dir, re-reads the
-      stored commit object after `hash-object -w` to confirm byte equality, verifies `HEAD` state has
-      not changed concurrently, and updates the exact branch ref (or `no-deref HEAD`) via `update-ref --stdin -z`
-      with a single-operation scoped token `GIT_BUTTRESS_INTERNAL_TX=seal-head:<old>:<new>`.
+    - Uses `DigestCache::memory_only()` whenever signing (`force_sign || explicit_sign_key.is_some() || old.has_gpgsig`)
+      and verifies all reachable ancestor seals before stamping a signature.
+      `sign_payload` supports `gpg.format` in `{"ssh", "openpgp", "x509"}` (honoring `gpg.ssh.program`,
+      `gpg.openpgp.program` / legacy `gpg.program`, and `gpg.x509.program` defaulting to `gpgsm` with
+      committer-identity fallback when `user.signingkey` is unset), validating SSH armor or
+      `[GNUPG:] SIG_CREATED` + non-empty armor via a mode-0700 exclusive temp dir (SSH) or threaded
+      stdin pipe (OpenPGP/X.509).
+    - Re-reads the stored commit object after `hash-object -w` to confirm byte equality, verifies `HEAD`
+      state has not changed concurrently, and updates the exact branch ref (or `no-deref HEAD`) via
+      `update-ref --stdin -z` with a single-operation scoped token `GIT_BUTTRESS_INTERNAL_TX=seal-head:<old>:<new>`.
   writes repo object store, target ref, `.git/buttress-cache.bin` (only when unsigned), stderr
 
 contract enable_buttress / disable_buttress
   ensures
-    - Saves prior `core.hooksPath` in `.buttress-prev-hooks-path` on first install and preserves it across
-      repeat `enable` runs; forwards all 28 standard `githooks(5)` hooks to any prior `core.hooksPath` or
-      `$GIT_COMMON_DIR/hooks/<name>` with binary-safe stdin replay and loop guards.
+    - On Git 2.56+ (`git hook list` supported, unless `GIT_BUTTRESS_FORCE_LEGACY_HOOKSPATH` is set):
+      registers native config-based `[hook "buttress-post-commit"]` and
+      `[hook "buttress-reference-transaction"]` sections without touching `core.hooksPath`
+      (coexisting natively with `git-lfs`, `pre-commit`, `husky`, and `.git/hooks/`), and migrates
+      cleanly off any legacy `git-buttress` `core.hooksPath` directory.
+    - On older Git: saves prior `core.hooksPath` in `.buttress-prev-hooks-path` on first install,
+      preserves it across repeat `enable` runs, and forwards standard `githooks(5)` hooks (excluding
+      `push-to-checkout` and `proc-receive`) to any prior `core.hooksPath` or `$GIT_COMMON_DIR/hooks/<name>`
+      with binary-safe stdin replay and loop guards.
     - Writes hook and wrapper scripts atomically via exclusive temp files (`create_new` + `rename`),
       refusing to overwrite symlinks or unrelated `git` binaries.
-    - `disable` restores the saved prior `core.hooksPath` (if `core.hooksPath` still points to ours),
-      removes generated hook scripts and our wrapper, and sets local `buttress.disabled=true` on `--local`.
+    - `disable` removes native `[hook "buttress-*"]` config sections, restores any saved prior
+      `core.hooksPath` (only if `core.hooksPath` still points to ours), removes generated hook scripts
+      and our wrapper, and on `--local` sets `buttress.disabled=true` plus local
+      `hook.buttress-*.enabled=false` so global hooks stay disabled in that repository.
 ```
 
 ### CLI Exit-Code Contracts (`src/main.rs`)

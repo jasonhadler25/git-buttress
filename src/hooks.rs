@@ -81,9 +81,85 @@ impl Drop for PrivateTempDir {
     }
 }
 
+/// Resolve Git's fallback signing identity (`Name <email>` from `git var GIT_COMMITTER_IDENT`),
+/// matching `gpg-interface.c:get_signing_key()` when neither `-S<key>` nor `user.signingkey` is set.
+fn committer_signing_ident(repo: &GitRepo) -> Option<String> {
+    let out = repo
+        .cmd()
+        .args(["var", "GIT_COMMITTER_IDENT"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let end = s.find('>')?;
+    let ident = s[..=end].trim();
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident.to_string())
+    }
+}
+
+/// Invoke a GPG-protocol signing program (`openpgp` / `gpg`, or `x509` / `gpgsm` / `gitsign`),
+/// matching Git's `gpg-interface.c:sign_buffer_gpg` (`--status-fd=2 -bsau <key>` or `-bsa`),
+/// feeding `payload` on a helper thread so large payloads never deadlock on stderr/stdout pipes,
+/// and validating exit status, `[GNUPG:] SIG_CREATED ` status line, and non-empty output armor.
+fn sign_with_gpg_protocol(
+    prog: &str,
+    format_label: &str,
+    key: Option<&str>,
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut cmd = Command::new(prog);
+    match key {
+        Some(k) => {
+            cmd.args(["--status-fd=2", "-bsau", k]);
+        }
+        None => {
+            cmd.args(["--status-fd=2", "-bsa"]);
+        }
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("run {prog}: {e}"))?;
+    let mut stdin = child.stdin.take().unwrap();
+    let payload_vec = payload.to_vec();
+    // Write stdin on a helper thread so large payloads never deadlock against child stdout/stderr!
+    let writer = std::thread::spawn(move || stdin.write_all(&payload_vec));
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait {prog}: {e}"))?;
+    let write_res = writer.join().map_err(|_| "signing stdin thread panicked")?;
+    if let Err(e) = write_res {
+        return Err(format!("write {prog} stdin: {e}"));
+    }
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    let saw_sig_created = stderr_str
+        .lines()
+        .any(|l| l.starts_with("[GNUPG:] SIG_CREATED "));
+    if !out.status.success() || !saw_sig_created {
+        return Err(format!(
+            "{prog} failed to create {format_label} signature: {}",
+            stderr_str.trim()
+        ));
+    }
+    let mut sig = out.stdout;
+    while sig.last() == Some(&b'\n') || sig.last() == Some(&b'\r') {
+        sig.pop();
+    }
+    if sig.is_empty() {
+        return Err(format!("{prog} returned empty signature output"));
+    }
+    Ok(sig)
+}
+
 /// Sign a commit or tag payload using `explicit_key` (e.g. from `git commit -S<key>`) or the
 /// repository's configured `user.signingkey`, validating non-empty signature armor
-/// (`[GNUPG:] SIG_CREATED` for OpenPGP, SSH armor for SSH).
+/// (`[GNUPG:] SIG_CREATED` for OpenPGP and X.509, SSH armor for SSH).
 pub fn sign_payload(
     repo: &GitRepo,
     payload: &[u8],
@@ -158,40 +234,15 @@ pub fn sign_payload(
                 .config_get_strict("gpg.program")?
                 .unwrap_or_else(|| "gpg".into()),
         };
-        let mut cmd = Command::new(&gpg_prog);
-        cmd.args(["--status-fd=2", "-bsa"]);
-        if let Some(ref k) = key {
-            cmd.args(["-u", k]);
-        }
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| format!("run {gpg_prog}: {e}"))?;
-        let mut stdin = child.stdin.take().unwrap();
-        let payload_vec = payload.to_vec();
-        // Write stdin on a helper thread so large payloads never deadlock against child stdout/stderr!
-        let writer = std::thread::spawn(move || stdin.write_all(&payload_vec));
-        let out = child.wait_with_output().map_err(|e| format!("wait {gpg_prog}: {e}"))?;
-        let write_res = writer.join().map_err(|_| "gpg stdin thread panicked")?;
-        if let Err(e) = write_res {
-            return Err(format!("write gpg stdin: {e}"));
-        }
-        let stderr_str = String::from_utf8_lossy(&out.stderr);
-        let saw_sig_created = stderr_str
-            .lines()
-            .any(|l| l.starts_with("[GNUPG:] SIG_CREATED "));
-        if !out.status.success() || !saw_sig_created {
-            return Err(format!(
-                "{gpg_prog} failed to create OpenPGP signature: {}",
-                stderr_str.trim()
-            ));
-        }
-        let mut sig = out.stdout;
-        while sig.last() == Some(&b'\n') || sig.last() == Some(&b'\r') {
-            sig.pop();
-        }
-        if sig.is_empty() {
-            return Err(format!("{gpg_prog} returned empty signature output"));
-        }
-        return Ok(sig);
+        return sign_with_gpg_protocol(&gpg_prog, "OpenPGP", key.as_deref(), payload);
+    }
+
+    if fmt == "x509" {
+        let x509_prog = repo
+            .config_get_strict("gpg.x509.program")?
+            .unwrap_or_else(|| "gpgsm".into());
+        let effective_key = key.or_else(|| committer_signing_ident(repo));
+        return sign_with_gpg_protocol(&x509_prog, "X.509", effective_key.as_deref(), payload);
     }
 
     Err(format!("unsupported gpg.format={fmt:?}"))
@@ -322,7 +373,7 @@ pub fn seal_head_with_key(
                 ));
             }
         }
-        if !force_sign && explicit_sign_key.is_none() || (head_pc.has_gpgsig && explicit_sign_key.is_none()) {
+        if explicit_sign_key.is_none() && (!force_sign || head_pc.has_gpgsig) {
             let d = keys.hash_sealed_commit(&head_pc.raw);
             if !want_sign {
                 let mut dc = DigestCache::load_from_git_dir(repo.common_dir());
@@ -918,8 +969,10 @@ fn split_git_global_args(args: &[OsString]) -> (Option<usize>, Vec<OsString>, Ve
                 }
                 global.push(args[i + 1].clone());
                 i += 2;
-                continue;
+            } else {
+                i += 1;
             }
+            continue;
         } else if let Some(rest) = s.strip_prefix("-c")
             && !rest.is_empty()
         {
@@ -1044,14 +1097,10 @@ fn scan_commit_flags(commit_args: &[OsString]) -> CommitFlagScan {
         }
         if matches!(
             s,
-            "-m" | "--message"
-                | "-F"
+            "--message"
                 | "--file"
-                | "-c"
                 | "--reedit-message"
-                | "-C"
                 | "--reuse-message"
-                | "-t"
                 | "--template"
                 | "--fixup"
                 | "--squash"
@@ -2037,4 +2086,188 @@ fn write_atomic_regular(dest: &Path, content: &[u8], mode: u32) -> Result<(), St
         }
     }
     Err(format!("could not create atomic temp file for {}", dest.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn os(xs: &[&str]) -> Vec<OsString> {
+        xs.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn scan_commit_flags_handles_all_variants() {
+        let s = scan_commit_flags(&os(&["-m", "-n", "--", "-q"]));
+        assert!(!s.is_preview_or_quiet);
+        assert!(!s.no_verify);
+        assert_eq!(s.explicit_sign_key, None);
+
+        for flag in [
+            "--dry-run",
+            "--short",
+            "--porcelain",
+            "--long",
+            "--null",
+            "-z",
+            "-h",
+            "--help",
+            "-q",
+            "--quiet",
+            "-aq",
+            "-az",
+            "-ah",
+        ] {
+            assert!(
+                scan_commit_flags(&os(&[flag])).is_preview_or_quiet,
+                "expected preview/quiet for {flag}"
+            );
+        }
+
+        assert!(scan_commit_flags(&os(&["--no-verify"])).no_verify);
+        assert!(scan_commit_flags(&os(&["-an"])).no_verify);
+        assert!(!scan_commit_flags(&os(&["--message", "--no-verify"])).no_verify);
+        assert!(!scan_commit_flags(&os(&["--author", "-q", "-m", "ok"])).is_preview_or_quiet);
+        assert!(!scan_commit_flags(&os(&["-F", "-q"])).is_preview_or_quiet);
+        assert!(!scan_commit_flags(&os(&["-c", "-q"])).is_preview_or_quiet);
+        assert!(!scan_commit_flags(&os(&["-C", "-q"])).is_preview_or_quiet);
+        assert!(!scan_commit_flags(&os(&["-t", "-q"])).is_preview_or_quiet);
+        assert!(!scan_commit_flags(&os(&["-ammsg", "--", "-n"])).no_verify);
+        // `-u` takes an optional attached value, NOT the next argument!
+        assert!(scan_commit_flags(&os(&["-u", "-q"])).is_preview_or_quiet);
+        assert!(!scan_commit_flags(&os(&["-un", "-m", "ok"])).no_verify);
+
+        // Signing key scanning: -S<key>, --gpg-sign=<key>, --gpg-sign=, --gpg-sign, --no-gpg-sign
+        assert_eq!(
+            scan_commit_flags(&os(&["-Smykey"])).explicit_sign_key.as_deref(),
+            Some("mykey")
+        );
+        assert_eq!(
+            scan_commit_flags(&os(&["-aSmykey"])).explicit_sign_key.as_deref(),
+            Some("mykey")
+        );
+        assert_eq!(scan_commit_flags(&os(&["-S"])).explicit_sign_key, None);
+        assert_eq!(
+            scan_commit_flags(&os(&["--gpg-sign=k1"])).explicit_sign_key.as_deref(),
+            Some("k1")
+        );
+        assert_eq!(scan_commit_flags(&os(&["--gpg-sign="])).explicit_sign_key, None);
+        assert!(scan_commit_flags(&os(&["--gpg-sign", "-q"])).is_preview_or_quiet);
+        assert_eq!(
+            scan_commit_flags(&os(&["-Sk1", "--no-gpg-sign"])).explicit_sign_key,
+            None
+        );
+        assert!(scan_commit_flags(&os(&["-n", "-Sk2", "-m", "hi"])).no_verify);
+        assert_eq!(
+            scan_commit_flags(&os(&["-n", "-Sk2", "-m", "hi"])).explicit_sign_key.as_deref(),
+            Some("k2")
+        );
+    }
+
+    #[test]
+    fn split_git_global_args_and_cli_overrides() {
+        let (idx, glob, cfgs) = split_git_global_args(&os(&[
+            "-C",
+            "/tmp/r",
+            "--no-pager",
+            "-c",
+            "buttress.disabled=true",
+            "-cbuttress.missing=warn",
+            "--git-dir",
+            "/tmp/g",
+            "commit",
+            "-m",
+            "hi",
+        ]));
+        assert_eq!(idx, Some(8));
+        assert_eq!(glob.len(), 8);
+        assert_eq!(cfgs, vec!["buttress.disabled=true", "buttress.missing=warn"]);
+        assert_eq!(has_cli_disabled(&cfgs), Some(true));
+        assert_eq!(cli_missing_override(&cfgs).as_deref(), Some("warn"));
+
+        assert_eq!(
+            has_cli_disabled(&["buttress.disabled=true".into(), "buttress.disabled=false".into()]),
+            Some(false)
+        );
+        assert_eq!(has_cli_disabled(&["buttress.disabled".into()]), Some(true));
+        assert_eq!(has_cli_disabled(&["buttress.disabled=1".into()]), Some(true));
+        assert_eq!(has_cli_disabled(&["other.key=true".into()]), None);
+        assert_eq!(
+            cli_missing_override(&["buttress.missing=warn".into(), "buttress.missing=error".into()])
+                .as_deref(),
+            Some("error")
+        );
+
+        // `--` terminates global parsing with no subcommand
+        let (idx2, _, _) = split_git_global_args(&os(&["--", "commit"]));
+        assert_eq!(idx2, None);
+        // Trailing `-C` without value doesn't panic
+        let (idx3, glob3, _) = split_git_global_args(&os(&["-C"]));
+        assert_eq!(idx3, None);
+        assert_eq!(glob3.len(), 1);
+    }
+
+    #[test]
+    fn parse_transaction_stdin_and_scoped_tokens() {
+        let recs = parse_transaction_stdin(Cursor::new(b"aaa bbb refs/heads/main\n")).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].0, b"aaa");
+        assert_eq!(recs[0].1, b"bbb");
+        assert_eq!(recs[0].2, b"refs/heads/main");
+
+        assert!(parse_transaction_stdin(Cursor::new(b"")).unwrap().is_empty());
+        assert!(parse_transaction_stdin(Cursor::new(b"nospace\n")).is_err());
+        assert!(parse_transaction_stdin(Cursor::new(b"one two\n")).is_err());
+        assert!(parse_transaction_stdin(Cursor::new(b" bbb refs/heads/m\n")).is_err());
+        assert!(parse_transaction_stdin(Cursor::new(b"aaa  refs/heads/m\n")).is_err());
+        assert!(parse_transaction_stdin(Cursor::new(b"aaa bbb \n")).is_err());
+        assert!(parse_transaction_stdin(Cursor::new(b"aaa bbb refs/\0bad\n")).is_err());
+
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized via ENV_LOCK in unit tests
+        unsafe { env::remove_var("GIT_BUTTRESS_INTERNAL_TX") };
+        assert!(!is_scoped_internal_tx(&recs));
+
+        unsafe { env::set_var("GIT_BUTTRESS_INTERNAL_TX", "seal-head:aaa:bbb") };
+        assert!(is_scoped_internal_tx(&recs));
+        assert!(!is_scoped_internal_tx(&[]));
+        assert!(!is_scoped_internal_tx(&[recs[0].clone(), recs[0].clone()]));
+        assert!(!is_scoped_internal_tx(&[(b"xxx".to_vec(), b"bbb".to_vec(), b"refs/heads/main".to_vec())]));
+        assert!(!is_scoped_internal_tx(&[(b"aaa".to_vec(), b"yyy".to_vec(), b"refs/heads/main".to_vec())]));
+
+        unsafe { env::set_var("GIT_BUTTRESS_INTERNAL_TX", "autotag:refs/tags/v1:bbb") };
+        assert!(is_scoped_internal_tx(&[(b"000".to_vec(), b"bbb".to_vec(), b"refs/tags/v1".to_vec())]));
+        assert!(!is_scoped_internal_tx(&[(b"000".to_vec(), b"bbb".to_vec(), b"refs/tags/v2".to_vec())]));
+        assert!(!is_scoped_internal_tx(&[(b"000".to_vec(), b"ccc".to_vec(), b"refs/tags/v1".to_vec())]));
+
+        unsafe { env::set_var("GIT_BUTTRESS_INTERNAL_TX", "other:aaa:bbb") };
+        assert!(!is_scoped_internal_tx(&recs));
+        unsafe { env::remove_var("GIT_BUTTRESS_INTERNAL_TX") };
+    }
+
+    #[test]
+    fn sanitize_and_private_temp_dir_and_forwarders() {
+        assert_eq!(sanitize_for_tty("hello\t\x1b[31m\r\n\x7fworld"), "hello\t?[31m???world");
+
+        let dir_path = {
+            let td = PrivateTempDir::create("git-buttress-ut").unwrap();
+            let p = td.0.clone();
+            assert!(p.is_dir());
+            assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o700);
+            p
+        };
+        assert!(!dir_path.exists(), "PrivateTempDir::drop must remove temp dir");
+
+        let fwd_pass = forward_hook_passthrough_stdin(Some("/prev/hooks"), "pre-push", "/usr/bin/git", Path::new("/ours"));
+        assert!(fwd_pass.contains("/prev/hooks/pre-push"));
+        assert!(fwd_pass.contains("GIT_BUTTRESS_FWD_PRE_PUSH"));
+
+        let fwd_tx = forward_reference_transaction(Some("/prev/hooks"), "/usr/bin/git", "/bin/git-buttress", Path::new("/ours"));
+        assert!(fwd_tx.contains("/prev/hooks/reference-transaction"));
+        assert!(fwd_tx.contains("__hook-reference-transaction"));
+    }
 }
